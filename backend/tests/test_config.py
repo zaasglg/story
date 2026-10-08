@@ -6,7 +6,10 @@ from backend.core.config import Settings
 
 def test_database_url_converts_render_postgres_url_for_asyncpg() -> None:
     settings = Settings(
-        database_url="postgres://user:pass@host.example/db?sslmode=require"
+        database_url=(
+            "postgres://user:pass@host.example/db"
+            "?sslmode=require&channel_binding=require"
+        )
     )
 
     assert settings.database_url == (

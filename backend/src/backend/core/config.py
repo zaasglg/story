@@ -15,6 +15,7 @@ def normalize_database_url(value: str) -> str:
     url = url.set(drivername="postgresql+asyncpg")
     query = dict(url.query)
     sslmode = query.pop("sslmode", None)
+    query.pop("channel_binding", None)
     if sslmode is not None and "ssl" not in query:
         query["ssl"] = sslmode
     return url.set(query=query).render_as_string(hide_password=False)
