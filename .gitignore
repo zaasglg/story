@@ -1,0 +1,16 @@
+.env
+.DS_Store
+*.log
+*.py[cod]
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+backend/.venv/
+backend/dist/
+mobile/.dart_tool/
+mobile/.idea/
+mobile/build/
+mobile/coverage/
+mobile/*.iml

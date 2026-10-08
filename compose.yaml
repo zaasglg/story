@@ -1,0 +1,90 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-m1917}
+      POSTGRES_USER: ${POSTGRES_USER:-m1917}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-m1917}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-m1917} -d ${POSTGRES_DB:-m1917}",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: ./backend
+    command: ["alembic", "upgrade", "head"]
+    environment: &backend-environment
+      M1917_ENVIRONMENT: ${M1917_ENVIRONMENT:-development}
+      M1917_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-m1917}:${POSTGRES_PASSWORD:-m1917}@postgres:5432/${POSTGRES_DB:-m1917}
+      M1917_REDIS_URL: redis://redis:6379/0
+      M1917_JWT_SECRET: ${M1917_JWT_SECRET:-development-only-change-this-secret}
+      M1917_OTP_PEPPER: ${M1917_OTP_PEPPER:-development-only-otp-pepper}
+      M1917_PII_ENCRYPTION_KEY: ${M1917_PII_ENCRYPTION_KEY:-0HzTSHdTqMQboIFWW1d8PuI2OhVrPYJBZ9ZCrVnz1kk=}
+      M1917_OTP_PROVIDER: ${M1917_OTP_PROVIDER:-console}
+      M1917_BOOTSTRAP_USERS_JSON: ${M1917_BOOTSTRAP_USERS_JSON:-[]}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  seed:
+    build:
+      context: ./backend
+    command: ["backend-seed"]
+    environment: *backend-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  backend:
+    build:
+      context: ./backend
+    environment: *backend-environment
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  mobile:
+    build:
+      context: ./mobile
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:

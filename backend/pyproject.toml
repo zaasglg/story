@@ -1,0 +1,49 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "ALASH M-1917 workforce management API"
+readme = "README.md"
+authors = [
+    { name = "Erdaulet Toibekov", email = "n4msin@mail.ru" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.20.0",
+    "asyncpg>=0.30.0",
+    "cryptography>=46.0.0",
+    "fastapi[standard]>=0.142.2",
+    "httpx>=0.28.0",
+    "phonenumbers>=9.0.0",
+    "pydantic-settings>=2.12.0",
+    "pyjwt[crypto]>=2.10.0",
+    "qrcode[pil]>=8.2",
+    "redis[hiredis]>=7.0.0",
+    "sqlalchemy[asyncio]>=2.0.0",
+]
+
+[project.scripts]
+backend = "backend:main"
+backend-seed = "backend.seed:main"
+
+[dependency-groups]
+dev = [
+    "aiosqlite>=0.21.0",
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.2.0",
+    "ruff>=0.14.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]

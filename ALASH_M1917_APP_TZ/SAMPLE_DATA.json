@@ -1,0 +1,30 @@
+{
+  "brand": "ALASH | M-1917",
+  "cities": [
+    "Lipetsk",
+    "Kursk",
+    "Voronezh",
+    "Belgorod",
+    "Oryol"
+  ],
+  "roles": [
+    "BOSS",
+    "ADMIN",
+    "MASTER",
+    "WORKER"
+  ],
+  "worker": {
+    "full_name": "Оразғали Асан",
+    "city": "Lipetsk",
+    "brigade": "№2",
+    "employee_id": "15487"
+  },
+  "example": {
+    "object": "Нысан №1",
+    "month": "Қыркүйек",
+    "revenue": 350000,
+    "expenses": 220000,
+    "net_profit": 130000,
+    "currency": "RUB"
+  }
+}
