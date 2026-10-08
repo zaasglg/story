@@ -3,6 +3,21 @@ from typing import Literal
 
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+
+
+def normalize_database_url(value: str) -> str:
+    """Convert provider-style PostgreSQL URLs for SQLAlchemy's asyncpg dialect."""
+    url = make_url(value)
+    if url.get_backend_name() not in {"postgres", "postgresql"}:
+        return value
+
+    url = url.set(drivername="postgresql+asyncpg")
+    query = dict(url.query)
+    sslmode = query.pop("sslmode", None)
+    if sslmode is not None and "ssl" not in query:
+        query["ssl"] = sslmode
+    return url.set(query=query).render_as_string(hide_password=False)
 
 
 class Settings(BaseSettings):
@@ -45,6 +60,13 @@ class Settings(BaseSettings):
     def parse_cors_origins(cls, value: object) -> object:
         if isinstance(value, str) and not value.startswith("["):
             return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("database_url", mode="before")
+    @classmethod
+    def parse_database_url(cls, value: object) -> object:
+        if isinstance(value, str):
+            return normalize_database_url(value)
         return value
 
     @model_validator(mode="after")
