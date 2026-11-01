@@ -1,4 +1,5 @@
 """Generate a new deployment's private environment; never overwrite existing keys."""
+
 from __future__ import annotations
 
 import argparse
@@ -11,7 +12,9 @@ from pathlib import Path
 
 
 def generate(domain: str | None, output: Path) -> None:
-    if domain and (not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", domain) or "." not in domain):
+    if domain and (
+        not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", domain) or "." not in domain
+    ):
         raise ValueError("Pass a domain name without scheme, path or port")
     values = {
         "SERVER_DOMAIN": domain.lower() if domain else "localhost",
@@ -19,7 +22,9 @@ def generate(domain: str | None, output: Path) -> None:
         "M1917_JWT_SECRET": secrets.token_urlsafe(48),
         "M1917_OTP_PEPPER": secrets.token_urlsafe(48),
         "M1917_PII_ENCRYPTION_KEY": base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
-        "M1917_CORS_ORIGINS": json.dumps([f"https://{domain.lower()}"] if domain else [], separators=(",", ":")),
+        "M1917_CORS_ORIGINS": json.dumps(
+            [f"https://{domain.lower()}"] if domain else [], separators=(",", ":")
+        ),
         "M1917_ATTENDANCE_AUTO_FROM": "",
         "M1917_ATTENDANCE_GRACE_MINUTES": "30",
     }
