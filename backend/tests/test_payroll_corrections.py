@@ -55,6 +55,14 @@ async def test_correction_chain_preserves_original_and_enforces_boss(context: Ap
     assert stale.status_code == 409
     final = await context.client.get("/api/v1/workers/me/finance?period=2026-10-01", headers=worker)
     assert final.json()[0]["bonus"] == "3000.00"
+    worker_history = await context.client.get(
+        "/api/v1/workers/me/finance/history?period=2026-10-01", headers=worker
+    )
+    assert worker_history.status_code == 200
+    assert worker_history.json()[0]["type"] == "BONUS"
+    assert worker_history.json()[0]["amount"] == "3000.00"
+    assert worker_history.json()[0]["reason"] == "Bonus"
+    assert worker_history.json()[0]["corrected"] is True
     second = await context.client.post(
         path,
         headers={**boss, "Idempotency-Key": "correction-2"},

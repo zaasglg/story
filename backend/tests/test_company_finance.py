@@ -39,9 +39,7 @@ async def test_boss_finance_approval_totals_and_forbidden_roles(context: AppCont
         "currency": "RUB",
         "category": "material",
     }
-    expense = await context.client.post(
-        "/api/v1/admin/expenses", headers=admin, json=expense_payload
-    )
+    expense = await context.client.post("/api/v1/boss/expenses", headers=boss, json=expense_payload)
     assert expense.status_code == 201
     draft = await context.client.get("/api/v1/boss/profit", headers=boss)
     assert draft.json() == []
@@ -68,7 +66,9 @@ async def test_boss_finance_approval_totals_and_forbidden_roles(context: AppCont
     )
     assert approved_revenue.status_code == 200
     approved_expense = await context.client.post(
-        f"/api/v1/boss/expenses/{expense.json()['id']}/approve", headers=boss
+        f"/api/v1/boss/expenses/{expense.json()['id']}/approve",
+        headers=boss,
+        json={"expected_revision": expense.json()["revision"]},
     )
     assert approved_expense.status_code == 200
     profit = await context.client.get(f"/api/v1/boss/finance/object/{object_id}", headers=boss)
@@ -77,12 +77,13 @@ async def test_boss_finance_approval_totals_and_forbidden_roles(context: AppCont
             "currency": "RUB",
             "approved_revenue": "350000.00",
             "approved_expenses": "220000.00",
+            "expense_breakdown": [{"category": "material", "amount": "220000.00"}],
             "net_profit": "130000.00",
         }
     ]
     updated = await context.client.put(
-        f"/api/v1/admin/expenses/{expense.json()['id']}",
-        headers=admin,
+        f"/api/v1/boss/expenses/{expense.json()['id']}",
+        headers=boss,
         json={**expense_payload, "amount": "230000.00"},
     )
     assert updated.status_code == 200

@@ -86,13 +86,13 @@ async def test_expense_reports_currency_archive_and_role_scope(context: AppConte
     boss = auth(await login(context, UserRole.BOSS))
     worker = auth(await login(context, UserRole.WORKER))
     master = auth(await login(context, UserRole.MASTER))
-    cities = await context.client.get("/api/v1/cities", headers=admin)
+    cities = await context.client.get("/api/v1/cities", headers=boss)
     city_id = cities.json()[0]["id"]
     ids = []
     for amount, currency in (("80.00", "RUB"), ("35.00", "RUB"), ("10.00", "KZT")):
         created = await context.client.post(
             "/api/v1/admin/expenses",
-            headers=admin,
+            headers=boss,
             json={
                 "city_id": city_id,
                 "expense_date": "2026-10-05",
@@ -104,18 +104,18 @@ async def test_expense_reports_currency_archive_and_role_scope(context: AppConte
         assert created.status_code == 201, created.text
         ids.append(created.json()["id"])
     report = await context.client.get(
-        "/api/v1/admin/expenses/monthly?year=2026&month=10", headers=admin
+        "/api/v1/admin/expenses/monthly?year=2026&month=10", headers=boss
     )
     assert report.status_code == 200, report.text
     totals = {row["currency"]: row["total"] for row in report.json()}
     assert totals == {"KZT": "10.00", "RUB": "115.00"}
     assert "revenue" not in report.text and "profit" not in report.text
-    for headers in (worker, master):
+    for headers in (admin, worker, master):
         denied = await context.client.get("/api/v1/admin/expenses", headers=headers)
         assert denied.status_code == 403
     removed = await context.client.delete(f"/api/v1/boss/expenses/{ids[0]}", headers=boss)
     assert removed.status_code == 204
-    daily = await context.client.get("/api/v1/admin/expenses/daily?day=2026-10-05", headers=admin)
+    daily = await context.client.get("/api/v1/admin/expenses/daily?day=2026-10-05", headers=boss)
     assert {row["currency"]: row["total"] for row in daily.json()} == {
         "KZT": "10.00",
         "RUB": "35.00",

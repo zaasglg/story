@@ -1,4 +1,4 @@
-"""Push registration and transactional staging; no external delivery yet."""
+"""Push registration and transactional staging for the dedicated sender."""
 
 from datetime import datetime, timedelta
 from hashlib import sha256
@@ -73,10 +73,17 @@ async def register_device(
         .with_for_update()
     )
     token_owner = await session.scalar(
-        select(PushDevice).where(PushDevice.token_hash == fingerprint)
+        select(PushDevice).where(PushDevice.token_hash == fingerprint).with_for_update()
     )
     if token_owner is not None and (item is None or token_owner.id != item.id):
-        raise ApiError(409, "device_token_conflict", "Device token is already registered")
+        if token_owner.revoked_at is None:
+            raise ApiError(409, "device_token_conflict", "Device token is already registered")
+        # Only an explicitly revoked token can move between signed-in accounts.
+        # Preserve device/delivery history without retaining a unique active claim.
+        token_owner.token_hash = sha256(
+            f"revoked:{token_owner.id}:{fingerprint}".encode()
+        ).hexdigest()
+        await session.flush()
     if item is None:
         item = PushDevice(user_id=actor.id, installation_id=payload.installation_id)
         session.add(item)

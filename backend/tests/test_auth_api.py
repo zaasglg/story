@@ -1,86 +1,71 @@
-from datetime import timedelta
-
 from conftest import AppContext, login
 from sqlalchemy import select, update
 
-from backend.core.time import utc_now
 from backend.identity.models import (
     AccountStatus,
-    AuditLog,
     AuthSession,
-    OtpChallenge,
     User,
     UserRole,
 )
 
 
-async def test_unknown_phone_never_receives_otp(context: AppContext) -> None:
-    phone = "+77081234567"
-    response = await context.client.post("/api/v1/auth/request-otp", json={"phone": phone})
-
-    assert response.status_code == 202
-    assert phone not in context.otp_sender.codes
+async def test_invalid_credentials_and_inactive_accounts(context: AppContext) -> None:
+    for phone, password in [
+        ("+77081234567", "Test-password-123"),
+        (context.phones[UserRole.WORKER], "wrong-password"),
+    ]:
+        response = await context.client.post(
+            "/api/v1/auth/login", json={"phone": phone, "password": password}
+        )
+        assert response.status_code == 401
+        assert response.json()["error"]["code"] == "invalid_credentials"
     async with context.database.session_factory() as session:
-        events = (await session.execute(select(AuditLog))).scalars().all()
-    assert [event.action for event in events] == ["AUTH_OTP_REQUEST_REJECTED"]
-    assert "phone" not in (events[0].metadata_json or {})
+        await session.execute(update(User).values(status=AccountStatus.BLOCKED))
+        await session.commit()
+    response = await context.client.post(
+        "/api/v1/auth/login",
+        json={"phone": context.phones[UserRole.WORKER], "password": "Test-password-123"},
+    )
+    assert response.status_code == 401
 
 
 async def test_role_cannot_be_submitted_during_auth(context: AppContext) -> None:
     response = await context.client.post(
-        "/api/v1/auth/request-otp",
-        json={"phone": context.phones[UserRole.WORKER], "role": "BOSS"},
+        "/api/v1/auth/login",
+        json={
+            "phone": context.phones[UserRole.WORKER],
+            "password": "Test-password-123",
+            "role": "BOSS",
+        },
     )
     assert response.status_code == 422
 
 
 async def test_openapi_auth_inputs_never_expose_role(context: AppContext) -> None:
     response = await context.client.get("/api/v1/openapi.json")
-    assert response.status_code == 200
     schemas = response.json()["components"]["schemas"]
-    for schema_name in ("OtpRequest", "OtpVerifyRequest", "RefreshRequest", "LogoutRequest"):
+    for schema_name in ("LoginRequest", "RefreshRequest", "LogoutRequest"):
         assert "role" not in schemas[schema_name].get("properties", {})
 
 
-async def test_inactive_phone_never_receives_otp(context: AppContext) -> None:
-    phone = context.phones[UserRole.WORKER]
-    async with context.database.session_factory() as session:
-        await session.execute(
-            update(User).where(User.phone == phone).values(status=AccountStatus.BLOCKED)
+async def test_login_is_rate_limited(context: AppContext) -> None:
+    for _ in range(context.settings.login_phone_hour_limit):
+        response = await context.client.post(
+            "/api/v1/auth/login",
+            json={"phone": context.phones[UserRole.WORKER], "password": "wrong"},
         )
-        await session.commit()
-
-    response = await context.client.post("/api/v1/auth/request-otp", json={"phone": phone})
-    assert response.status_code == 202
-    assert phone not in context.otp_sender.codes
-
-
-async def test_otp_resend_is_rate_limited(context: AppContext) -> None:
-    phone = context.phones[UserRole.WORKER]
-    first = await context.client.post("/api/v1/auth/request-otp", json={"phone": phone})
-    second = await context.client.post("/api/v1/auth/request-otp", json={"phone": phone})
-
-    assert first.status_code == 202
-    assert second.status_code == 429
-    assert second.json()["error"]["code"] == "otp_rate_limited"
-
-
-async def test_expired_otp_is_rejected(context: AppContext) -> None:
-    phone = context.phones[UserRole.WORKER]
-    await context.client.post("/api/v1/auth/request-otp", json={"phone": phone})
-    code = context.otp_sender.codes[phone]
-    async with context.database.session_factory() as session:
-        await session.execute(
-            update(OtpChallenge).values(expires_at=utc_now() - timedelta(seconds=1))
-        )
-        await session.commit()
-
+        assert response.status_code == 401
     response = await context.client.post(
-        "/api/v1/auth/verify-otp",
-        json={"phone": phone, "code": code, "device_name": "pytest"},
+        "/api/v1/auth/login",
+        json={"phone": context.phones[UserRole.WORKER], "password": "Test-password-123"},
     )
-    assert response.status_code == 400
-    assert response.json()["error"]["code"] == "otp_invalid"
+    assert response.status_code == 429
+
+
+async def test_otp_endpoints_removed(context: AppContext) -> None:
+    for endpoint in ("request-otp", "verify-otp"):
+        response = await context.client.post(f"/api/v1/auth/{endpoint}", json={})
+        assert response.status_code == 404
 
 
 async def test_every_role_is_loaded_from_database(context: AppContext) -> None:
@@ -92,34 +77,6 @@ async def test_every_role_is_loaded_from_database(context: AppContext) -> None:
         )
         assert response.status_code == 200
         assert response.json()["role"] == role.value
-
-
-async def test_otp_is_single_use_and_attempts_are_recorded(context: AppContext) -> None:
-    phone = context.phones[UserRole.WORKER]
-    await context.client.post("/api/v1/auth/request-otp", json={"phone": phone})
-    code = context.otp_sender.codes[phone]
-
-    wrong = await context.client.post(
-        "/api/v1/auth/verify-otp",
-        json={"phone": phone, "code": "000000", "device_name": "pytest"},
-    )
-    if code == "000000":
-        wrong = await context.client.post(
-            "/api/v1/auth/verify-otp",
-            json={"phone": phone, "code": "111111", "device_name": "pytest"},
-        )
-    assert wrong.status_code == 400
-
-    valid = await context.client.post(
-        "/api/v1/auth/verify-otp",
-        json={"phone": phone, "code": code, "device_name": "pytest"},
-    )
-    assert valid.status_code == 200
-    reused = await context.client.post(
-        "/api/v1/auth/verify-otp",
-        json={"phone": phone, "code": code, "device_name": "pytest"},
-    )
-    assert reused.status_code == 400
 
 
 async def test_refresh_rotation_and_reuse_revokes_sessions(context: AppContext) -> None:
@@ -166,3 +123,38 @@ async def test_session_list_does_not_expose_token_hash(context: AppContext) -> N
     assert response.status_code == 200
     assert response.json()[0]["current"] is True
     assert "refresh_token_hash" not in response.json()[0]
+
+
+async def test_password_reset_revokes_sessions_and_hash_is_private(context: AppContext) -> None:
+    from unittest.mock import patch
+
+    from backend.set_password import set_password
+
+    tokens = await login(context, UserRole.WORKER)
+    assert "password_hash" not in tokens["user"]
+    with patch("backend.set_password.get_settings", return_value=context.settings):
+        await set_password(context.phones[UserRole.WORKER], "New-password-123")
+    response = await context.client.get(
+        "/api/v1/me", headers={"Authorization": f"Bearer {tokens['access_token']}"}
+    )
+    assert response.status_code == 401
+    for password, status in [("Test-password-123", 401), ("New-password-123", 200)]:
+        response = await context.client.post(
+            "/api/v1/auth/login",
+            json={"phone": context.phones[UserRole.WORKER], "password": password},
+        )
+        assert response.status_code == status
+
+
+async def test_account_without_password_cannot_login(context: AppContext) -> None:
+    async with context.database.session_factory() as session:
+        await session.execute(update(User).values(password_hash=None))
+        await session.commit()
+    response = await context.client.post(
+        "/api/v1/auth/login",
+        json={
+            "phone": context.phones[UserRole.WORKER],
+            "password": "invalid-account-dummy-password",
+        },
+    )
+    assert response.status_code == 401

@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field, model_validator
 
+from backend.core.time import ensure_utc
 from backend.operations.models import AttendanceStatus, WorkDayStatus
 
 
@@ -31,6 +32,9 @@ class TariffRead(TariffCreate):
 
 
 class ScheduleCreate(BaseModel):
+    approved: bool = True
+    is_working_day: bool = True
+
     worker_user_id: UUID
     brigade_id: UUID
     object_id: UUID
@@ -46,6 +50,9 @@ class ScheduleCreate(BaseModel):
 
 
 class ScheduleUpdate(UpdateModel):
+    approved: bool | None = None
+    is_working_day: bool | None = None
+
     brigade_id: UUID | None = None
     object_id: UUID | None = None
     work_date: date | None = None
@@ -70,7 +77,11 @@ class AttendanceCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_times(self) -> "AttendanceCreate":
-        if self.check_in and self.check_out and self.check_out <= self.check_in:
+        if (
+            self.check_in
+            and self.check_out
+            and ensure_utc(self.check_out) <= ensure_utc(self.check_in)
+        ):
             raise ValueError("Check-out must be after check-in")
         return self
 
@@ -100,7 +111,11 @@ class WorkDayCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_times(self) -> "WorkDayCreate":
-        if self.check_in and self.check_out and self.check_out <= self.check_in:
+        if (
+            self.check_in
+            and self.check_out
+            and ensure_utc(self.check_out) <= ensure_utc(self.check_in)
+        ):
             raise ValueError("Check-out must be after check-in")
         return self
 

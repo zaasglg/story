@@ -20,8 +20,21 @@ def opaque_hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def generate_otp() -> str:
-    return f"{secrets.randbelow(1_000_000):06d}"
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt.encode(), n=16384, r=8, p=1)
+    return f"scrypt${salt}${digest.hex()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, salt, expected = encoded.split("$")
+        if algorithm != "scrypt":
+            return False
+        digest = hashlib.scrypt(password.encode(), salt=salt.encode(), n=16384, r=8, p=1)
+        return hmac.compare_digest(digest.hex(), expected)
+    except (ValueError, TypeError):
+        return False
 
 
 def issue_access_token(user: User, session_id: UUID, settings: Settings) -> str:

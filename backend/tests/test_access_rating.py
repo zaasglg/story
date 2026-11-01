@@ -44,7 +44,18 @@ async def test_pass_authorization_revoke_replay_and_roles(context: AppContext) -
     assert granted.status_code == 201
     active = await context.client.get("/api/v1/workers/me/pass", headers=worker)
     assert active.json()["status"] == "ACTIVE"
+    assert active.json()["valid_from"] == payload["valid_from"]
+    assert active.json()["valid_until"] == payload["valid_until"]
+    assert active.json()["phone"] == context.phones[UserRole.WORKER]
+    assert Decimal(str(active.json()["rating"])) == Decimal("5.0")
     assert base64.b64decode(active.json()["qr_png_base64"]).startswith(b"\x89PNG\r\n\x1a\n")
+    for headers in (worker, master, boss):
+        denied_scan = await context.client.post(
+            "/api/v1/admin/pass-scans",
+            headers=headers,
+            json={"qr_payload": active.json()["qr_payload"]},
+        )
+        assert denied_scan.status_code == 403
     scanned = await context.client.post(
         "/api/v1/admin/pass-scans", headers=admin, json={"qr_payload": active.json()["qr_payload"]}
     )
@@ -85,7 +96,7 @@ async def test_pass_authorization_revoke_replay_and_roles(context: AppContext) -
     assert expired_scan.status_code == 422
 
 
-async def test_rating_absence_persists_and_14_day_reward(context: AppContext) -> None:
+async def test_rating_absence_reversal_and_14_day_reward(context: AppContext) -> None:
     admin = auth(await login(context, UserRole.ADMIN))
     worker = auth(await login(context, UserRole.WORKER))
     async with context.database.session_factory() as session:
@@ -106,7 +117,7 @@ async def test_rating_absence_persists_and_14_day_reward(context: AppContext) ->
     )
     assert correction.status_code == 200
     rating = await context.client.get("/api/v1/workers/me/rating", headers=worker)
-    assert Decimal(str(rating.json()["rating"])) == Decimal("4.9")
+    assert Decimal(str(rating.json()["rating"])) == Decimal("5")
     for offset in range(14, 0, -1):
         attended = await context.client.post(
             "/api/v1/admin/attendance",
@@ -120,7 +131,11 @@ async def test_rating_absence_persists_and_14_day_reward(context: AppContext) ->
         assert attended.status_code == 201
     rating = await context.client.get("/api/v1/workers/me/rating", headers=worker)
     assert Decimal(str(rating.json()["rating"])) == Decimal("5")
-    assert [event["event_type"] for event in rating.json()["history"]] == ["ABSENCE", "STREAK_14"]
+    assert [event["event_type"] for event in rating.json()["history"]] == [
+        "ABSENCE",
+        "ATTENDANCE_REVERSED",
+        "STREAK_14",
+    ]
     violation = await context.client.post(
         "/api/v1/admin/rating-events",
         headers=admin,

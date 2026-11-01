@@ -1,6 +1,7 @@
 import hmac
+from asyncio import to_thread
 from datetime import timedelta
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,17 +11,18 @@ from backend.audit.service import add_audit_event
 from backend.core.config import Settings
 from backend.core.errors import ApiError
 from backend.core.time import ensure_utc, utc_now
-from backend.identity.models import AccountStatus, AuthSession, OtpChallenge, User
-from backend.identity.otp import OtpSender, RateLimiter
+from backend.identity.models import AccountStatus, AuthSession, User
+from backend.identity.otp import RateLimiter
 from backend.identity.phone import normalize_phone
 from backend.identity.schemas import SessionResponse, TokenResponse, UserResponse
 from backend.identity.security import (
-    generate_otp,
     generate_refresh_token,
+    hash_password,
     issue_access_token,
     opaque_hash,
     parse_refresh_token,
     secret_hash,
+    verify_password,
 )
 
 
@@ -45,95 +47,18 @@ class AuthService:
     def __init__(
         self,
         settings: Settings,
-        otp_sender: OtpSender,
         rate_limiter: RateLimiter,
     ) -> None:
         self.settings = settings
-        self.otp_sender = otp_sender
+        self.dummy_password_hash = hash_password("invalid-account-dummy-password")
         self.rate_limiter = rate_limiter
 
-    async def request_otp(
+    async def login(
         self,
         session: AsyncSession,
         *,
         phone_input: str,
-        ip_address: str,
-        request_id: str | None,
-    ) -> int:
-        phone = normalize_phone(phone_input)
-        phone_hash = client_hash(phone, self.settings)
-        ip_hash = client_hash(ip_address, self.settings)
-
-        allowed_phone = await self.rate_limiter.hit(
-            f"otp:hour:phone:{phone_hash}", self.settings.otp_phone_hour_limit, 3600
-        )
-        allowed_ip = await self.rate_limiter.hit(
-            f"otp:hour:ip:{ip_hash}", self.settings.otp_ip_hour_limit, 3600
-        )
-        cooldown_ok = await self.rate_limiter.hit(
-            f"otp:cooldown:{phone_hash}", 1, self.settings.otp_resend_seconds
-        )
-        if not allowed_phone or not allowed_ip or not cooldown_ok:
-            raise ApiError(429, "otp_rate_limited", "Please wait before requesting another code")
-
-        result = await session.execute(
-            select(User).where(User.phone == phone).options(selectinload(User.profile))
-        )
-        user = result.scalar_one_or_none()
-        if user is None or user.status is not AccountStatus.ACTIVE:
-            add_audit_event(
-                session,
-                action="AUTH_OTP_REQUEST_REJECTED",
-                entity_type="auth",
-                metadata={"phone_hash": phone_hash, "reason": "not_eligible"},
-                request_id=request_id,
-                ip_hash=ip_hash,
-                succeeded=False,
-            )
-            await session.commit()
-            return self.settings.otp_resend_seconds
-
-        now = utc_now()
-        await session.execute(
-            update(OtpChallenge)
-            .where(OtpChallenge.user_id == user.id, OtpChallenge.consumed_at.is_(None))
-            .values(consumed_at=now)
-        )
-        code = generate_otp()
-        challenge_id = uuid4()
-        challenge = OtpChallenge(
-            id=challenge_id,
-            user_id=user.id,
-            phone_hash=phone_hash,
-            code_hash=secret_hash(
-                f"{challenge_id}:{code}", self.settings.otp_pepper.get_secret_value()
-            ),
-            attempts=0,
-            max_attempts=self.settings.otp_max_attempts,
-            expires_at=now + timedelta(seconds=self.settings.otp_ttl_seconds),
-            created_at=now,
-            request_ip_hash=ip_hash,
-        )
-        session.add(challenge)
-        add_audit_event(
-            session,
-            action="AUTH_OTP_REQUESTED",
-            entity_type="user",
-            entity_id=user.id,
-            actor_user_id=user.id,
-            request_id=request_id,
-            ip_hash=ip_hash,
-        )
-        await self.otp_sender.send(phone, code)
-        await session.commit()
-        return self.settings.otp_resend_seconds
-
-    async def verify_otp(
-        self,
-        session: AsyncSession,
-        *,
-        phone_input: str,
-        code: str,
+        password: str,
         device_name: str,
         ip_address: str,
         user_agent: str | None,
@@ -141,51 +66,45 @@ class AuthService:
     ) -> TokenResponse:
         phone = normalize_phone(phone_input)
         ip_hash = client_hash(ip_address, self.settings)
-        verify_allowed = await self.rate_limiter.hit(
-            f"otp:verify:ip:{ip_hash}", self.settings.otp_ip_hour_limit * 2, 3600
+        phone_hash = client_hash(phone, self.settings)
+        allowed_phone = await self.rate_limiter.hit(
+            f"login:phone:{phone_hash}", self.settings.login_phone_hour_limit, 3600
         )
-        if not verify_allowed:
-            raise ApiError(429, "otp_rate_limited", "Too many verification attempts")
-
+        allowed_ip = await self.rate_limiter.hit(
+            f"login:ip:{ip_hash}", self.settings.login_ip_hour_limit, 3600
+        )
+        if not allowed_phone or not allowed_ip:
+            raise ApiError(429, "login_rate_limited", "Too many login attempts")
         result = await session.execute(
-            select(User).where(User.phone == phone).options(selectinload(User.profile))
-        )
-        user = result.scalar_one_or_none()
-        if user is None or user.status is not AccountStatus.ACTIVE:
-            raise ApiError(400, "otp_invalid", "The verification code is invalid or expired")
-
-        challenge_result = await session.execute(
-            select(OtpChallenge)
-            .where(OtpChallenge.user_id == user.id, OtpChallenge.consumed_at.is_(None))
-            .order_by(OtpChallenge.created_at.desc())
+            select(User)
+            .where(User.phone == phone)
+            .options(selectinload(User.profile))
             .with_for_update()
         )
-        challenge = challenge_result.scalars().first()
-        now = utc_now()
-        if challenge is None or ensure_utc(challenge.expires_at) <= now:
-            raise ApiError(400, "otp_invalid", "The verification code is invalid or expired")
-        if challenge.attempts >= challenge.max_attempts:
-            raise ApiError(400, "otp_locked", "The verification code can no longer be used")
-
-        challenge.attempts += 1
-        candidate_hash = secret_hash(
-            f"{challenge.id}:{code}", self.settings.otp_pepper.get_secret_value()
+        user = result.scalar_one_or_none()
+        valid = await to_thread(
+            verify_password,
+            password,
+            user.password_hash if user and user.password_hash else self.dummy_password_hash,
         )
-        if not hmac.compare_digest(candidate_hash, challenge.code_hash):
+        if (
+            not valid
+            or user is None
+            or user.password_hash is None
+            or user.status is not AccountStatus.ACTIVE
+        ):
             add_audit_event(
                 session,
-                action="AUTH_OTP_VERIFY_FAILED",
-                entity_type="user",
-                entity_id=user.id,
-                actor_user_id=user.id,
+                action="AUTH_LOGIN_FAILED",
+                entity_type="auth",
+                metadata={"phone_hash": phone_hash},
                 request_id=request_id,
                 ip_hash=ip_hash,
                 succeeded=False,
             )
             await session.commit()
-            raise ApiError(400, "otp_invalid", "The verification code is invalid or expired")
-
-        challenge.consumed_at = now
+            raise ApiError(401, "invalid_credentials", "Phone or password is incorrect")
+        now = utc_now()
         auth_session = AuthSession(
             user_id=user.id,
             refresh_token_hash="pending",

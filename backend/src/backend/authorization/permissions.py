@@ -8,6 +8,7 @@ class Permission(StrEnum):
     WORKER_PUBLIC_READ = "worker:read:public"
     WORKER_READ_ALL = "worker:read:all"
     WORKER_MANAGE = "worker:manage"
+    SHIFT_SCAN = "shift:scan"
     TEAM_READ = "team:read"
     WORKDAY_READ_OWN = "workday:read:own"
     WORKDAY_READ_TEAM = "workday:read:team"
@@ -26,6 +27,7 @@ class Permission(StrEnum):
     PROFIT_READ = "profit:read"
     WORKER_BANK_READ_OWN = "worker_bank:read:own"
     WORKER_BANK_READ_ALL = "worker_bank:read:all"
+    PERSONAL_BANK_MANAGE = "personal_bank:manage:own"
     COMPANY_BANK_READ = "company_bank:read"
     COMPANY_BANK_MANAGE = "company_bank:manage"
     FINANCIAL_REQUEST_CREATE = "financial_request:create"
@@ -57,8 +59,8 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.PROFILE_READ_OWN,
             Permission.WORKER_PUBLIC_READ,
             Permission.TEAM_READ,
+            Permission.SHIFT_SCAN,
             Permission.WORKDAY_READ_TEAM,
-            Permission.ORGANIZATION_READ,
             Permission.ANNOUNCEMENT_RECEIVE,
             Permission.CHAT_USE,
         }
@@ -71,13 +73,11 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.WORKER_MANAGE,
             Permission.WORKDAY_READ_ALL,
             Permission.WORKDAY_MANAGE,
+            Permission.SHIFT_SCAN,
             Permission.ORGANIZATION_READ,
             Permission.ORGANIZATION_MANAGE,
             Permission.EQUIPMENT_READ_ALL,
             Permission.EQUIPMENT_MANAGE,
-            Permission.EXPENSE_READ,
-            Permission.EXPENSE_MANAGE,
-            Permission.WORKER_BANK_READ_ALL,
             Permission.FINANCIAL_REQUEST_CREATE,
             Permission.AUDIT_READ_ADMIN,
             Permission.ANNOUNCEMENT_RECEIVE,
@@ -100,6 +100,7 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.REVENUE_MANAGE,
             Permission.PROFIT_READ,
             Permission.WORKER_BANK_READ_ALL,
+            Permission.PERSONAL_BANK_MANAGE,
             Permission.COMPANY_BANK_READ,
             Permission.COMPANY_BANK_MANAGE,
             Permission.FINANCIAL_REQUEST_APPROVE,

@@ -3,6 +3,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     Date,
     DateTime,
@@ -20,8 +21,20 @@ from backend.identity.models import Base
 
 
 class Expense(Base):
+    recipient: Mapped[str | None] = mapped_column(String(255))
+
+    revision: Mapped[int] = mapped_column(default=0, server_default="0", nullable=False)
+
     __tablename__ = "expenses"
-    __table_args__ = (CheckConstraint("amount > 0", name="ck_expense_positive_amount"),)
+    payroll_entry_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("ledger_entries.id", ondelete="RESTRICT")
+    )
+    payroll_source_key: Mapped[str | None] = mapped_column(String(128), unique=True)
+    __table_args__ = (
+        CheckConstraint(
+            "amount > 0 OR payroll_entry_id IS NOT NULL", name="ck_expense_positive_amount"
+        ),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     object_id: Mapped[UUID | None] = mapped_column(
@@ -77,9 +90,25 @@ class FinancialRequest(Base):
     __tablename__ = "financial_requests"
     __table_args__ = (
         UniqueConstraint("created_by", "idempotency_key"),
-        CheckConstraint("amount > 0", name="ck_financial_request_amount"),
+        Index(
+            "uq_pending_salary_change",
+            "ledger_entry_id",
+            unique=True,
+            postgresql_where=text("type = 'SALARY_CHANGE' AND status = 'PENDING_BOSS'"),
+            sqlite_where=text("type = 'SALARY_CHANGE' AND status = 'PENDING_BOSS'"),
+        ),
         CheckConstraint(
-            "type IN ('SALARY','BONUS','PENALTY','ADVANCE','PAYMENT')",
+            "type != 'SALARY_CHANGE' OR (ledger_entry_id IS NOT NULL AND "
+            "expected_amount IS NOT NULL AND expected_amount >= 0 AND "
+            "expected_revision IS NOT NULL AND expected_revision >= 0)",
+            name="ck_salary_change_snapshot",
+        ),
+        CheckConstraint(
+            "(type = 'SALARY_CHANGE' AND amount >= 0) OR (type != 'SALARY_CHANGE' AND amount > 0)",
+            name="ck_financial_request_amount",
+        ),
+        CheckConstraint(
+            "type IN ('SALARY','BONUS','PENALTY','ADVANCE','PAYMENT','SALARY_CHANGE')",
             name="ck_financial_request_type",
         ),
         CheckConstraint(
@@ -87,6 +116,16 @@ class FinancialRequest(Base):
             name="ck_financial_request_status",
         ),
     )
+    ledger_entry_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey(
+            "ledger_entries.id",
+            ondelete="RESTRICT",
+            use_alter=True,
+            name="fk_salary_change_ledger_entry",
+        )
+    )
+    expected_amount: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    expected_revision: Mapped[int | None] = mapped_column()
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     worker_user_id: Mapped[UUID] = mapped_column(
         ForeignKey("users.id", ondelete="RESTRICT"), index=True
@@ -106,6 +145,9 @@ class FinancialRequest(Base):
 
 class LedgerEntry(Base):
     __tablename__ = "ledger_entries"
+    cost_integrated: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false", nullable=False
+    )
     __table_args__ = (
         UniqueConstraint("request_id"),
         Index(
@@ -150,3 +192,14 @@ class LedgerCorrection(Base):
     actor_user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PersonalBankAccount(Base):
+    __tablename__ = "personal_bank_accounts"
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    owner_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    details_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

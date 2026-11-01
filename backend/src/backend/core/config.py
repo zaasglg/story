@@ -1,3 +1,4 @@
+from datetime import date
 from functools import lru_cache
 from typing import Literal
 
@@ -41,20 +42,27 @@ class Settings(BaseSettings):
     access_token_minutes: int = Field(default=15, ge=5, le=60)
     refresh_token_days: int = Field(default=30, ge=1, le=90)
 
-    otp_provider: Literal["console", "test", "sms"] = "console"
-    sms_gateway_url: str | None = None
-    sms_api_token: SecretStr | None = None
-    sms_sender_name: str = "ALASH"
     otp_pepper: SecretStr = SecretStr("development-only-otp-pepper")
     pii_encryption_key: SecretStr = SecretStr("0HzTSHdTqMQboIFWW1d8PuI2OhVrPYJBZ9ZCrVnz1kk=")
-    otp_ttl_seconds: int = Field(default=300, ge=60, le=600)
-    otp_resend_seconds: int = Field(default=60, ge=10, le=300)
-    otp_max_attempts: int = Field(default=5, ge=3, le=10)
-    otp_phone_hour_limit: int = Field(default=6, ge=1, le=20)
-    otp_ip_hour_limit: int = Field(default=30, ge=1, le=200)
+    login_phone_hour_limit: int = Field(default=10, ge=1, le=100)
+    login_ip_hour_limit: int = Field(default=100, ge=1, le=1000)
 
     bootstrap_users_json: str = "[]"
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:8080"]
+    geocoding_url: str = "https://photon.komoot.io"
+    map_tile_url: str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    map_attribution: str = "© OpenStreetMap contributors"
+    map_attribution_url: str = "https://www.openstreetmap.org/copyright"
+    attendance_auto_enabled: bool = False
+    attendance_auto_from: date | None = None
+    attendance_grace_minutes: int = Field(default=30, ge=0, le=1440)
+    attendance_poll_seconds: float = Field(default=30, ge=1, le=3600)
+
+    push_enabled: bool = False
+    firebase_project_id: str | None = None
+    firebase_credentials_file: str | None = None
+    push_poll_seconds: float = Field(default=2, ge=0.1, le=60)
+    push_web_url: str | None = None
 
     @field_validator("cors_origins", mode="before")
     @classmethod
@@ -73,12 +81,6 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_production_secrets(self) -> "Settings":
         if self.environment == "production":
-            if self.otp_provider != "sms":
-                raise ValueError("M1917_OTP_PROVIDER must be 'sms' in production")
-            if not self.sms_gateway_url or self.sms_api_token is None:
-                raise ValueError("SMS gateway URL and token are required in production")
-            if not self.sms_gateway_url.startswith("https://"):
-                raise ValueError("M1917_SMS_GATEWAY_URL must use HTTPS in production")
             jwt_secret = self.jwt_secret.get_secret_value()
             otp_pepper = self.otp_pepper.get_secret_value()
             pii_key = self.pii_encryption_key.get_secret_value()

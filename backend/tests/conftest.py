@@ -1,8 +1,12 @@
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from uuid import uuid4
 
+import asyncpg
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy.engine import make_url
 
 from backend.communications.models import ChatThread
 from backend.core.config import Settings
@@ -10,44 +14,45 @@ from backend.core.database import Database
 from backend.core.time import utc_now
 from backend.identity.models import AccountStatus, Base, EmployeeProfile, User, UserRole
 from backend.identity.otp import MemoryRateLimiter
+from backend.identity.security import hash_password
 from backend.main import create_app
 from backend.workforce.models import City
-
-
-class CapturingOtpSender:
-    def __init__(self) -> None:
-        self.codes: dict[str, str] = {}
-
-    async def send(self, phone: str, code: str) -> None:
-        self.codes[phone] = code
 
 
 @dataclass
 class AppContext:
     client: AsyncClient
     database: Database
-    otp_sender: CapturingOtpSender
     phones: dict[UserRole, str]
     settings: Settings
 
 
 @pytest.fixture
 async def context(tmp_path) -> AsyncIterator[AppContext]:
-    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+    postgres_url = os.environ.get("M1917_TEST_CONTEXT_POSTGRES_URL")
+    admin_connection = None
+    database_name = None
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'test.db'}"
+    if postgres_url:
+        server = make_url(postgres_url)
+        admin_connection = await asyncpg.connect(
+            server.set(drivername="postgresql").render_as_string(hide_password=False)
+        )
+        database_name = f"defect_test_{uuid4().hex}"
+        await admin_connection.execute(f'CREATE DATABASE "{database_name}"')
+        database_url = server.set(
+            drivername="postgresql+asyncpg", database=database_name
+        ).render_as_string(hide_password=False)
+    database = Database(database_url)
     settings = Settings(
         environment="test",
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'test.db'}",
+        database_url=database_url,
         redis_url="redis://unused",
         jwt_secret="test-jwt-secret-that-is-long-and-independent",
         otp_pepper="test-otp-pepper-that-is-long-and-independent",
-        otp_provider="test",
-        otp_resend_seconds=10,
-        otp_phone_hour_limit=10,
-        otp_ip_hour_limit=100,
     )
-    sender = CapturingOtpSender()
     limiter = MemoryRateLimiter()
-    app = create_app(settings, database=database, rate_limiter=limiter, otp_sender=sender)
+    app = create_app(settings, database=database, rate_limiter=limiter)
 
     async with database.engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
@@ -69,6 +74,7 @@ async def context(tmp_path) -> AsyncIterator[AppContext]:
         for index, (role, phone) in enumerate(phones.items(), start=1):
             user = User(
                 phone=phone,
+                password_hash=hash_password("Test-password-123"),
                 role=role,
                 status=AccountStatus.ACTIVE,
                 created_at=now,
@@ -96,17 +102,20 @@ async def context(tmp_path) -> AsyncIterator[AppContext]:
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://testserver"
         ) as client:
-            yield AppContext(client, database, sender, phones, settings)
+            try:
+                yield AppContext(client, database, phones, settings)
+            finally:
+                await database.dispose()
+                if admin_connection is not None:
+                    await admin_connection.execute(f'DROP DATABASE "{database_name}" WITH (FORCE)')
+                    await admin_connection.close()
 
 
 async def login(context: AppContext, role: UserRole) -> dict[str, object]:
     phone = context.phones[role]
-    response = await context.client.post("/api/v1/auth/request-otp", json={"phone": phone})
-    assert response.status_code == 202
-    code = context.otp_sender.codes[phone]
     response = await context.client.post(
-        "/api/v1/auth/verify-otp",
-        json={"phone": phone, "code": code, "device_name": "pytest"},
+        "/api/v1/auth/login",
+        json={"phone": phone, "password": "Test-password-123", "device_name": "pytest"},
     )
     assert response.status_code == 200, response.text
     return response.json()

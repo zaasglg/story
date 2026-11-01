@@ -13,7 +13,7 @@ from backend.authorization.dependencies import require_permission
 from backend.authorization.permissions import Permission
 from backend.core.errors import ApiError
 from backend.core.time import utc_now
-from backend.equipment.models import EquipmentIssue, EquipmentItem, StockMovement
+from backend.equipment.models import EquipmentIssue, EquipmentItem, EquipmentPhoto, StockMovement
 from backend.identity.dependencies import CurrentUser, get_db_session
 from backend.workforce.service import require_worker
 
@@ -28,11 +28,13 @@ class ItemCreate(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     serial_number: str | None = Field(default=None, min_length=1, max_length=128)
     quantity: int = Field(ge=0, le=1000000)
+    photo_url: str | None = Field(default=None, max_length=128)
 
 
 class ItemUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=255)
+    photo_url: str | None = Field(default=None, max_length=128)
 
 
 class ItemRead(BaseModel):
@@ -41,6 +43,7 @@ class ItemRead(BaseModel):
     name: str
     serial_number: str | None
     available_quantity: int
+    photo_url: str | None
 
 
 class StockAdjustment(BaseModel):
@@ -66,6 +69,7 @@ class IssueRead(BaseModel):
     id: UUID
     equipment_id: UUID
     equipment_name: str
+    equipment_photo_url: str | None = None
     worker_user_id: UUID
     quantity: int
     issue_date: date
@@ -79,6 +83,20 @@ class MovementRead(BaseModel):
     equipment_id: UUID
     delta: int
     reason: str
+
+
+async def validate_photo(session: AsyncSession, url: str | None) -> None:
+    if url is None:
+        return
+    try:
+        prefix, identifier = url.rsplit("/", 1)
+        if prefix != "/equipment-photos":
+            raise ValueError
+        photo_id = UUID(identifier)
+    except ValueError as exc:
+        raise ApiError(422, "invalid_photo", "Upload an equipment photo first") from exc
+    if await session.get(EquipmentPhoto, photo_id) is None:
+        raise ApiError(422, "invalid_photo", "Equipment photo was not found")
 
 
 def event(
@@ -120,6 +138,7 @@ async def issue_read(session: AsyncSession, issue: EquipmentIssue) -> IssueRead:
         id=issue.id,
         equipment_id=item.id,
         equipment_name=item.name,
+        equipment_photo_url=item.photo_url,
         worker_user_id=issue.worker_user_id,
         quantity=issue.quantity,
         issue_date=issue.issue_date,
@@ -146,9 +165,11 @@ async def list_items(session: Session, _: Reader) -> list[EquipmentItem]:
 async def create_item(
     payload: ItemCreate, request: Request, session: Session, actor: Manager
 ) -> EquipmentItem:
+    await validate_photo(session, payload.photo_url)
     now = utc_now()
     item = EquipmentItem(
         name=payload.name,
+        photo_url=payload.photo_url,
         serial_number=payload.serial_number,
         available_quantity=payload.quantity,
         created_at=now,
@@ -189,6 +210,9 @@ async def update_item(
     item = await session.get(EquipmentItem, item_id)
     if item is None or item.archived_at is not None:
         raise ApiError(404, "equipment_not_found", "Equipment was not found")
+    if "photo_url" in payload.model_fields_set:
+        await validate_photo(session, payload.photo_url)
+        item.photo_url = payload.photo_url
     item.name, item.updated_at = payload.name, utc_now()
     event(session, request, actor, "EQUIPMENT_UPDATED", item.id)
     await session.commit()

@@ -4,6 +4,7 @@ from enum import StrEnum
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
+    Boolean,
     Date,
     DateTime,
     Enum,
@@ -63,6 +64,9 @@ class TariffHistory(Base):
 
 
 class WorkSchedule(Base):
+    approved: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("false"))
+    is_working_day: Mapped[bool] = mapped_column(Boolean, default=True, server_default=text("true"))
+
     __tablename__ = "work_schedules"
     __table_args__ = (UniqueConstraint("worker_user_id", "work_date"),)
 
@@ -144,3 +148,39 @@ class WorkDay(Base):
 
     brigade: Mapped[Brigade] = relationship()
     work_object: Mapped[WorkObject] = relationship()
+
+
+class ProductionEntry(Base):
+    __tablename__ = "production_entries"
+
+    object_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("work_objects.id", ondelete="RESTRICT")
+    )
+    timezone: Mapped[str | None] = mapped_column(String(64))
+
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    worker_user_id: Mapped[UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    volume_m3: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(240))
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+
+class ObjectCalendarDay(Base):
+    """Approved object-wide day exceptions, including schedules created later."""
+
+    __tablename__ = "object_calendar_days"
+    __table_args__ = (UniqueConstraint("object_id", "work_date"),)
+    id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
+    object_id: Mapped[UUID] = mapped_column(ForeignKey("work_objects.id", ondelete="RESTRICT"))
+    work_date: Mapped[date] = mapped_column(Date, index=True)
+    is_working_day: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    reason: Mapped[str] = mapped_column(Text)
+    created_by: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    updated_by: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -1,16 +1,18 @@
+import hashlib
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Form, Query, Request, Response, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.audit.service import add_audit_event
 from backend.authorization.dependencies import require_permission
 from backend.authorization.permissions import Permission
+from backend.communications.audio import validate_audio
 from backend.communications.models import (
     Announcement,
     ChatMessage,
@@ -22,7 +24,7 @@ from backend.communications.push import stage_notifications
 from backend.core.errors import ApiError
 from backend.core.time import utc_now
 from backend.identity.dependencies import CurrentUser, get_db_session
-from backend.identity.models import AccountStatus, EmployeeProfile, User
+from backend.identity.models import AccountStatus, EmployeeProfile, User, UserRole
 
 router = APIRouter(tags=["communications"])
 Session = Annotated[AsyncSession, Depends(get_db_session)]
@@ -138,26 +140,153 @@ class ThreadRead(BaseModel):
     key: str
     user_one_id: UUID | None
     user_two_id: UUID | None
+    peer_name: str | None = None
+    peer_role: str | None = None
+    last_message: str | None = None
+    last_message_at: datetime | None = None
+
+
+class ChatContactRead(BaseModel):
+    id: UUID
+    full_name: str
+    role: str
+
+
+@router.get("/chats/contacts", response_model=list[ChatContactRead])
+async def chat_contacts(
+    session: Session, actor: Chatter, q: str = "", limit: Limit = 50, offset: Offset = 0
+) -> list[ChatContactRead]:
+    query = (
+        select(User.id, EmployeeProfile.full_name, User.role)
+        .join(EmployeeProfile, EmployeeProfile.user_id == User.id)
+        .where(
+            User.id != actor.id,
+            User.status == AccountStatus.ACTIVE,
+            User.archived_at.is_(None),
+            EmployeeProfile.archived_at.is_(None),
+        )
+    )
+    if actor.role == UserRole.MASTER:
+        query = query.where(
+            or_(
+                User.role.in_([UserRole.ADMIN, UserRole.BOSS]),
+                (User.role == UserRole.WORKER) & (EmployeeProfile.master_user_id == actor.id),
+            )
+        )
+    if q.strip():
+        query = query.where(EmployeeProfile.full_name.icontains(q.strip(), autoescape=True))
+    rows = (
+        await session.execute(
+            query.order_by(EmployeeProfile.full_name, User.id).limit(limit).offset(offset)
+        )
+    ).all()
+    return [
+        ChatContactRead(id=row.id, full_name=row.full_name, role=row.role.value) for row in rows
+    ]
+
+
+async def thread_views(
+    session: AsyncSession, threads: list[ChatThread], actor: CurrentUser
+) -> list[ThreadRead]:
+    if not threads:
+        return []
+    peer_ids = {
+        item.user_two_id if item.user_one_id == actor.id else item.user_one_id
+        for item in threads
+        if item.key != "GENERAL"
+    }
+    peers = {
+        row.id: row
+        for row in (
+            await session.execute(
+                select(User.id, User.role, EmployeeProfile.full_name)
+                .outerjoin(EmployeeProfile, EmployeeProfile.user_id == User.id)
+                .where(User.id.in_(peer_ids))
+            )
+        ).all()
+    }
+    ranked = (
+        select(
+            ChatMessage.thread_id,
+            ChatMessage.body,
+            ChatMessage.created_at,
+            func.row_number()
+            .over(
+                partition_by=ChatMessage.thread_id,
+                order_by=(ChatMessage.created_at.desc(), ChatMessage.id),
+            )
+            .label("rank"),
+        )
+        .where(ChatMessage.thread_id.in_([item.id for item in threads]))
+        .subquery()
+    )
+    latest = {
+        row.thread_id: row
+        for row in (await session.execute(select(ranked).where(ranked.c.rank == 1))).all()
+    }
+    result = []
+    for item in threads:
+        view = ThreadRead.model_validate(item)
+        peer = peers.get(item.user_two_id if item.user_one_id == actor.id else item.user_one_id)
+        if peer:
+            view.peer_name = peer.full_name or "Пользователь"
+            view.peer_role = peer.role.value
+        message = latest.get(item.id)
+        if message:
+            view.last_message = message.body
+            view.last_message_at = message.created_at
+        result.append(view)
+    return sorted(
+        result,
+        key=lambda item: item.last_message_at.isoformat() if item.last_message_at else "",
+        reverse=True,
+    )
+
+
+async def master_contact_allowed(session: AsyncSession, actor: CurrentUser, peer_id: UUID) -> bool:
+    if actor.role != UserRole.MASTER:
+        return True
+    return bool(
+        await session.scalar(
+            select(User.id)
+            .join(EmployeeProfile, EmployeeProfile.user_id == User.id)
+            .where(
+                User.id == peer_id,
+                User.archived_at.is_(None),
+                EmployeeProfile.archived_at.is_(None),
+                or_(
+                    User.role.in_([UserRole.ADMIN, UserRole.BOSS]),
+                    (User.role == UserRole.WORKER) & (EmployeeProfile.master_user_id == actor.id),
+                ),
+            )
+        )
+    )
 
 
 async def require_thread(session: AsyncSession, thread_id: UUID, actor: CurrentUser) -> ChatThread:
     item = await session.get(ChatThread, thread_id)
-    if item is None or (
-        item.key != "GENERAL" and actor.id not in (item.user_one_id, item.user_two_id)
+    if (
+        item is None
+        or (item.key == "GENERAL" and actor.role == UserRole.WORKER)
+        or (item.key != "GENERAL" and actor.id not in (item.user_one_id, item.user_two_id))
     ):
         raise ApiError(404, "chat_not_found", "Chat was not found")
+    if item.key != "GENERAL":
+        peer = item.user_two_id if actor.id == item.user_one_id else item.user_one_id
+        if not await master_contact_allowed(session, actor, peer):
+            raise ApiError(404, "chat_not_found", "Chat was not found")
     return item
 
 
 @router.get("/chats", response_model=list[ThreadRead])
-async def chats(session: Session, actor: Chatter) -> list[ChatThread]:
-    return list(
+async def chats(session: Session, actor: Chatter) -> list[ThreadRead]:
+    threads = list(
         (
             await session.scalars(
                 select(ChatThread)
                 .where(
                     or_(
-                        ChatThread.key == "GENERAL",
+                        (ChatThread.key == "GENERAL") & (actor.role != UserRole.WORKER),
                         ChatThread.user_one_id == actor.id,
                         ChatThread.user_two_id == actor.id,
                     )
@@ -166,10 +295,18 @@ async def chats(session: Session, actor: Chatter) -> list[ChatThread]:
             )
         ).all()
     )
+    if actor.role == UserRole.MASTER:
+        visible = []
+        for item in threads:
+            peer = item.user_two_id if actor.id == item.user_one_id else item.user_one_id
+            if item.key == "GENERAL" or await master_contact_allowed(session, actor, peer):
+                visible.append(item)
+        threads = visible
+    return await thread_views(session, threads, actor)
 
 
 @router.post("/chats/direct/{recipient_id}", response_model=ThreadRead)
-async def direct_chat(recipient_id: UUID, session: Session, actor: Chatter) -> ChatThread:
+async def direct_chat(recipient_id: UUID, session: Session, actor: Chatter) -> ThreadRead:
     if recipient_id == actor.id:
         raise ApiError(422, "invalid_chat_recipient", "Choose another chat participant")
     recipient = await session.get(User, recipient_id)
@@ -179,11 +316,13 @@ async def direct_chat(recipient_id: UUID, session: Session, actor: Chatter) -> C
         or recipient.archived_at is not None
     ):
         raise ApiError(404, "recipient_not_found", "Chat recipient was not found")
+    if not await master_contact_allowed(session, actor, recipient_id):
+        raise ApiError(404, "recipient_not_found", "Chat recipient was not found")
     one, two = sorted((actor.id, recipient_id), key=str)
     key = f"{one}:{two}"
     item = await session.scalar(select(ChatThread).where(ChatThread.key == key))
     if item:
-        return item
+        return (await thread_views(session, [item], actor))[0]
     item = ChatThread(key=key, user_one_id=one, user_two_id=two, created_at=utc_now())
     session.add(item)
     try:
@@ -193,7 +332,7 @@ async def direct_chat(recipient_id: UUID, session: Session, actor: Chatter) -> C
         item = await session.scalar(select(ChatThread).where(ChatThread.key == key))
         if item is None:
             raise ApiError(409, "chat_conflict", "Chat could not be created") from None
-    return item
+    return (await thread_views(session, [item], actor))[0]
 
 
 class MessageCreate(BaseModel):
@@ -203,7 +342,7 @@ class MessageCreate(BaseModel):
 
 
 @router.post("/chats/manager", response_model=ThreadRead)
-async def manager_chat(session: Session, actor: Chatter) -> ChatThread:
+async def manager_chat(session: Session, actor: Chatter) -> ThreadRead:
     manager_id = await session.scalar(
         select(EmployeeProfile.master_user_id).where(
             EmployeeProfile.user_id == actor.id, EmployeeProfile.archived_at.is_(None)
@@ -220,6 +359,41 @@ class MessageRead(MessageCreate):
     thread_id: UUID
     sender_user_id: UUID
     created_at: datetime
+    sender_name: str | None = None
+    sender_role: str | None = None
+    is_own: bool = False
+    voice_duration_ms: int | None = None
+    voice_mime: str | None = None
+    voice_url: str | None = None
+
+
+async def message_views(
+    session: AsyncSession, items: list[ChatMessage], actor: CurrentUser
+) -> list[MessageRead]:
+    if not items:
+        return []
+    senders = {
+        row.id: row
+        for row in (
+            await session.execute(
+                select(User.id, User.role, EmployeeProfile.full_name)
+                .outerjoin(EmployeeProfile, EmployeeProfile.user_id == User.id)
+                .where(User.id.in_({item.sender_user_id for item in items}))
+            )
+        ).all()
+    }
+    result = []
+    for item in items:
+        view = MessageRead.model_validate(item)
+        if item.voice_mime:
+            view.voice_url = f"/chats/{item.thread_id}/messages/{item.id}/voice"
+        sender = senders.get(item.sender_user_id)
+        if sender:
+            view.sender_name = sender.full_name or "Пользователь"
+            view.sender_role = sender.role.value
+        view.is_own = item.sender_user_id == actor.id
+        result.append(view)
+    return result
 
 
 @router.get("/chats/{thread_id}/messages", response_model=list[MessageRead])
@@ -230,7 +404,7 @@ async def messages(
     limit: Limit = 50,
     offset: Offset = 0,
     before_id: UUID | None = None,
-) -> list[ChatMessage]:
+) -> list[MessageRead]:
     await require_thread(session, thread_id, actor)
     query = select(ChatMessage).where(ChatMessage.thread_id == thread_id)
     if before_id is not None:
@@ -243,7 +417,7 @@ async def messages(
                 (ChatMessage.created_at == anchor.created_at) & (ChatMessage.id > anchor.id),
             )
         )
-    return list(
+    items = list(
         (
             await session.scalars(
                 query.order_by(ChatMessage.created_at.desc(), ChatMessage.id)
@@ -252,12 +426,13 @@ async def messages(
             )
         ).all()
     )
+    return await message_views(session, items, actor)
 
 
 @router.post("/chats/{thread_id}/messages", response_model=MessageRead, status_code=201)
 async def send_message(
-    thread_id: UUID, payload: MessageCreate, session: Session, actor: Chatter
-) -> ChatMessage:
+    thread_id: UUID, payload: MessageCreate, session: Session, actor: Chatter, request: Request
+) -> MessageRead:
     thread = await require_thread(session, thread_id, actor)
     query = select(ChatMessage).where(
         ChatMessage.thread_id == thread_id,
@@ -266,9 +441,9 @@ async def send_message(
     )
     existing = await session.scalar(query)
     if existing:
-        if existing.body != payload.body:
+        if existing.body != payload.body or existing.voice_mime is not None:
             raise ApiError(409, "message_key_conflict", "Message key was already used")
-        return existing
+        return (await message_views(session, [existing], actor))[0]
     item = ChatMessage(
         **payload.model_dump(), thread_id=thread_id, sender_user_id=actor.id, created_at=utc_now()
     )
@@ -293,10 +468,111 @@ async def send_message(
     except IntegrityError as exc:
         await session.rollback()
         existing = await session.scalar(query)
-        if existing and existing.body == payload.body:
-            return existing
+        if existing and existing.body == payload.body and existing.voice_mime is None:
+            return (await message_views(session, [existing], actor))[0]
         raise ApiError(409, "message_key_conflict", "Message key was already used") from exc
-    return item
+    await request.app.state.chat_events.publish(thread_id)
+    return (await message_views(session, [item], actor))[0]
+
+
+@router.post("/chats/{thread_id}/voice", response_model=MessageRead, status_code=201)
+async def send_voice(
+    thread_id: UUID,
+    session: Session,
+    actor: Chatter,
+    request: Request,
+    file: UploadFile,
+    client_message_id: Annotated[str, Form(min_length=1, max_length=128)],
+    duration_ms: Annotated[int, Form(ge=500, le=300000)],
+) -> MessageRead:
+    thread = await require_thread(session, thread_id, actor)
+    content = await file.read(5 * 1024 * 1024 + 1)
+    await file.close()
+    if len(content) > 5 * 1024 * 1024:
+        raise ApiError(413, "voice_too_large", "Voice recording exceeds 5 MB")
+    if len(content) < 32:
+        raise ApiError(422, "invalid_voice", "Recording is empty or invalid")
+    if content[4:8] == b"ftyp":
+        mime = "audio/mp4"
+    elif content[:4] == b"\x1a\x45\xdf\xa3":
+        mime = "audio/webm"
+    elif content[:4] == b"OggS":
+        mime = "audio/ogg"
+    else:
+        raise ApiError(422, "invalid_voice", "Expected M4A, WebM or Ogg audio")
+    await validate_audio(content, mime, duration_ms)
+    digest = hashlib.sha256(content).hexdigest()
+    query = select(ChatMessage).where(
+        ChatMessage.thread_id == thread_id,
+        ChatMessage.sender_user_id == actor.id,
+        ChatMessage.client_message_id == client_message_id,
+    )
+    existing = await session.scalar(query)
+    if existing:
+        if existing.voice_sha256 != digest or existing.voice_duration_ms != duration_ms:
+            raise ApiError(409, "message_key_conflict", "Message key was already used")
+        return (await message_views(session, [existing], actor))[0]
+    item = ChatMessage(
+        thread_id=thread_id,
+        sender_user_id=actor.id,
+        client_message_id=client_message_id,
+        body="Голосовое сообщение",
+        created_at=utc_now(),
+        voice_content=content,
+        voice_mime=mime,
+        voice_duration_ms=duration_ms,
+        voice_sha256=digest,
+    )
+    session.add(item)
+    try:
+        await session.flush()
+        if thread.key != "GENERAL":
+            recipient = thread.user_two_id if thread.user_one_id == actor.id else thread.user_one_id
+            await stage_notifications(
+                session,
+                [
+                    Notification(
+                        recipient_user_id=recipient,
+                        title="Жаңа хабарлама",
+                        body="Голосовое сообщение",
+                        created_at=item.created_at,
+                    )
+                ],
+            )
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        existing = await session.scalar(query)
+        if (
+            existing
+            and existing.voice_sha256 == digest
+            and existing.voice_duration_ms == duration_ms
+        ):
+            return (await message_views(session, [existing], actor))[0]
+        raise ApiError(409, "message_key_conflict", "Message key was already used") from exc
+    await request.app.state.chat_events.publish(thread_id)
+    return (await message_views(session, [item], actor))[0]
+
+
+@router.get("/chats/{thread_id}/messages/{message_id}/voice")
+async def voice_content(thread_id: UUID, message_id: UUID, session: Session, actor: Chatter):
+    await require_thread(session, thread_id, actor)
+    row = (
+        await session.execute(
+            select(ChatMessage.voice_content, ChatMessage.voice_mime).where(
+                ChatMessage.id == message_id,
+                ChatMessage.thread_id == thread_id,
+                ChatMessage.voice_mime.is_not(None),
+            )
+        )
+    ).first()
+    if row is None or row.voice_content is None:
+        raise ApiError(404, "voice_not_found", "Recording was not found")
+    return Response(
+        row.voice_content,
+        media_type=row.voice_mime,
+        headers={"Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 class TicketCreate(BaseModel):
@@ -312,6 +588,7 @@ class TicketRead(TicketCreate):
     status: str
     created_at: datetime
     resolved_at: datetime | None
+    requester_name: str | None = None
 
 
 @router.post("/me/support-tickets", response_model=TicketRead, status_code=201)
@@ -372,18 +649,38 @@ async def own_tickets(
 
 @router.get("/admin/support-tickets", response_model=list[TicketRead])
 async def support_queue(
-    session: Session, _: Publisher, limit: Limit = 50, offset: Offset = 0
-) -> list[SupportTicket]:
-    return list(
-        (
-            await session.scalars(
-                select(SupportTicket)
-                .order_by(SupportTicket.created_at.desc(), SupportTicket.id)
-                .limit(limit)
-                .offset(offset)
-            )
-        ).all()
+    session: Session,
+    _: Publisher,
+    limit: Limit = 50,
+    offset: Offset = 0,
+    status: Literal["OPEN", "RESOLVED"] | None = None,
+    q: Annotated[str | None, Query(max_length=255)] = None,
+) -> list[TicketRead]:
+    query = select(SupportTicket, EmployeeProfile.full_name).outerjoin(
+        EmployeeProfile, EmployeeProfile.user_id == SupportTicket.requester_user_id
     )
+    if status:
+        query = query.where(SupportTicket.status == status)
+    if q and q.strip():
+        term = q.strip()
+        query = query.where(
+            or_(
+                SupportTicket.subject.icontains(term, autoescape=True),
+                SupportTicket.body.icontains(term, autoescape=True),
+                EmployeeProfile.full_name.icontains(term, autoescape=True),
+            )
+        )
+    rows = (
+        await session.execute(
+            query.order_by(SupportTicket.created_at.desc(), SupportTicket.id)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return [
+        TicketRead.model_validate(item).model_copy(update={"requester_name": name})
+        for item, name in rows
+    ]
 
 
 @router.post("/admin/support-tickets/{item_id}/resolve", response_model=TicketRead)

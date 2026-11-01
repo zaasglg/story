@@ -19,9 +19,13 @@ def test_permission_matrix_is_explicit_for_all_roles() -> None:
 
 def test_admin_financial_secrets_are_denied() -> None:
     forbidden = {
+        Permission.EXPENSE_READ,
+        Permission.EXPENSE_MANAGE,
+        Permission.WORKER_BANK_READ_ALL,
         Permission.REVENUE_READ,
         Permission.REVENUE_MANAGE,
         Permission.PROFIT_READ,
+        Permission.PERSONAL_BANK_MANAGE,
         Permission.COMPANY_BANK_READ,
         Permission.COMPANY_BANK_MANAGE,
         Permission.FINANCIAL_REQUEST_APPROVE,

@@ -37,7 +37,10 @@ Category = Literal[
 
 
 class ExpenseWrite(BaseModel):
+    recipient: str | None = Field(default=None, max_length=255)
+
     model_config = ConfigDict(extra="forbid")
+    change_reason: str | None = Field(default=None, min_length=3, max_length=2000, exclude=True)
     object_id: UUID | None = None
     city_id: UUID
     expense_date: date
@@ -52,6 +55,9 @@ class ExpenseRead(ExpenseWrite):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     status: str
+    amount: Decimal
+    payroll_entry_id: UUID | None = None
+    revision: int
 
 
 class ExpenseTotal(BaseModel):
@@ -223,16 +229,30 @@ async def get_expense(expense_id: UUID, session: Session, _: Reader) -> Expense:
 async def update_expense(
     expense_id: UUID, payload: ExpenseWrite, request: Request, session: Session, actor: Manager
 ) -> Expense:
-    item = await session.get(Expense, expense_id)
+    item = await session.scalar(select(Expense).where(Expense.id == expense_id).with_for_update())
     if item is None or item.archived_at is not None:
         raise ApiError(404, "expense_not_found", "Expense was not found")
+    if item.payroll_entry_id is not None:
+        raise ApiError(
+            409,
+            "payroll_expense_managed",
+            "Correct the payroll entry instead of its linked expense",
+        )
     await validate_expense(session, payload)
-    for key, value in payload.model_dump().items():
-        setattr(item, key, value)
-    item.updated_by, item.updated_at = actor.id, utc_now()
-    item.status = "DRAFT"
+    # Always write the status, including when the loaded snapshot was already
+    # DRAFT. ORM dirty tracking would otherwise omit it after a concurrent approval.
+    session.info["audit_reason"] = payload.change_reason
+    for field, value in payload.model_dump().items():
+        setattr(item, field, value)
+    item.updated_by, item.updated_at, item.status = actor.id, utc_now(), "DRAFT"
+    item.revision += 1
+    # The row lock serializes approval and edits. ORM snapshots retain every changed field.
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(item, "status")
     audit(session, request, actor, "EXPENSE_UPDATED", item)
     await session.commit()
+    await session.refresh(item)
     return item
 
 
@@ -241,11 +261,18 @@ async def update_expense(
 async def archive_expense(
     expense_id: UUID, request: Request, session: Session, actor: Manager
 ) -> Response:
-    item = await session.get(Expense, expense_id)
+    item = await session.get(Expense, expense_id, with_for_update=True)
     if item is None or item.archived_at is not None:
         raise ApiError(404, "expense_not_found", "Expense was not found")
+    if item.payroll_entry_id is not None:
+        raise ApiError(
+            409,
+            "payroll_expense_managed",
+            "Correct the payroll entry instead of its linked expense",
+        )
     item.archived_at = item.updated_at = utc_now()
     item.updated_by = actor.id
+    item.revision += 1
     audit(session, request, actor, "EXPENSE_ARCHIVED", item)
     await session.commit()
     return Response(status_code=204)

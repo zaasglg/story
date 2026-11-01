@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import DateTime, ForeignKey, LargeBinary, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.identity.models import Base
@@ -50,6 +50,10 @@ class ChatMessage(Base):
     sender_user_id: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))
     client_message_id: Mapped[str] = mapped_column(String(128), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
+    voice_content: Mapped[bytes | None] = mapped_column(LargeBinary, deferred=True)
+    voice_mime: Mapped[str | None] = mapped_column(String(32))
+    voice_duration_ms: Mapped[int | None]
+    voice_sha256: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 

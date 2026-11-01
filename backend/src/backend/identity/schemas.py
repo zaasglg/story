@@ -6,22 +6,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from backend.identity.models import AccountStatus, UserRole
 
 
-class OtpRequest(BaseModel):
+class LoginRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     phone: str = Field(min_length=7, max_length=32)
-
-
-class OtpRequestResponse(BaseModel):
-    status: str = "accepted"
-    retry_after_seconds: int
-
-
-class OtpVerifyRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    phone: str = Field(min_length=7, max_length=32)
-    code: str = Field(pattern=r"^\d{6}$")
+    password: str = Field(min_length=1, max_length=128)
     device_name: str = Field(default="Unknown device", min_length=1, max_length=255)
 
 
@@ -68,3 +57,9 @@ class SessionResponse(BaseModel):
 
 class MessageResponse(BaseModel):
     status: str
+
+
+class PasswordChangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    current_password: str = Field(min_length=1, max_length=128, repr=False)
+    new_password: str = Field(min_length=8, max_length=128, repr=False)

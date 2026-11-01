@@ -69,6 +69,7 @@ async def public_projection(session: AsyncSession, worker: User) -> WorkerPublic
     return WorkerPublicRead(
         id=worker.id,
         full_name=profile.full_name,
+        position=profile.position,
         role=worker.role,
         photo_url=profile.photo_url,
         city=await city_name(session, profile),
@@ -115,8 +116,74 @@ async def private_projection(
     )
     return WorkerPrivateRead(
         **(await team_projection(session, worker)).model_dump(),
+        city_id=profile.city_id,
         phone=worker.phone,
         status=worker.status,
         hire_date=profile.hire_date,
         passport_number=passport,
     )
+
+
+async def validate_worker_city(
+    session: AsyncSession, worker_id: UUID, city_id: UUID | None
+) -> None:
+    assignment = await active_assignment(session, worker_id)
+    if assignment is not None and assignment.brigade.city_id != city_id:
+        raise ApiError(
+            422,
+            "assignment_city_mismatch",
+            "End or change the assignment before changing the worker city",
+        )
+
+
+async def require_closed_shift(session: AsyncSession, worker_id: UUID) -> None:
+    from backend.operations.models import AttendanceRecord
+
+    await session.scalar(select(User).where(User.id == worker_id).with_for_update())
+    opened = await session.scalar(
+        select(AttendanceRecord.id)
+        .where(
+            AttendanceRecord.worker_user_id == worker_id,
+            AttendanceRecord.archived_at.is_(None),
+            AttendanceRecord.check_in.is_not(None),
+            AttendanceRecord.check_out.is_(None),
+        )
+        .limit(1)
+    )
+    if opened is not None:
+        raise ApiError(
+            409,
+            "open_shift_assignment_locked",
+            "Close the worker shift before changing or ending the assignment",
+        )
+
+
+async def require_context_closed(session: AsyncSession, field: str, identity: UUID) -> None:
+    """Called under the brigade/object lock; do not invert the worker→context lock order."""
+    from backend.access.models import ShiftScanEvent
+    from backend.operations.models import AttendanceRecord
+
+    assigned = select(WorkerAssignment.worker_user_id).where(
+        getattr(WorkerAssignment, field) == identity,
+        WorkerAssignment.effective_to.is_(None),
+        WorkerAssignment.archived_at.is_(None),
+    )
+    snapshots = select(ShiftScanEvent.attendance_id).where(
+        getattr(ShiftScanEvent, field) == identity, ShiftScanEvent.action == "CHECK_IN"
+    )
+    opened = await session.scalar(
+        select(AttendanceRecord.id)
+        .where(
+            AttendanceRecord.archived_at.is_(None),
+            AttendanceRecord.check_in.is_not(None),
+            AttendanceRecord.check_out.is_(None),
+            AttendanceRecord.worker_user_id.in_(assigned) | AttendanceRecord.id.in_(snapshots),
+        )
+        .limit(1)
+    )
+    if opened is not None:
+        raise ApiError(
+            409,
+            "open_shift_assignment_locked",
+            "Close existing shifts before changing their context",
+        )

@@ -68,6 +68,14 @@ async def test_push_registration_own_scope_and_secrets(context: AppContext) -> N
         assert revoked.status_code == 204
         assert revoked.content == b""
     assert (await context.client.get(path, headers=headers[UserRole.WORKER])).json() == []
+    # Explicit revocation permits re-registration without taking over an active device.
+    reclaimed = await context.client.post(
+        path,
+        headers=headers[UserRole.ADMIN],
+        json={**payload, "token": "rotated-private-token-12345"},
+    )
+    assert reclaimed.status_code == 200
+    assert reclaimed.json()["id"] != device_id
 
 
 async def test_notifications_stage_outbox_atomically_and_chat_replay(context: AppContext) -> None:

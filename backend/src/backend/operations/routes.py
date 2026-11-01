@@ -18,9 +18,10 @@ from backend.authorization.permissions import Permission
 from backend.core.errors import ApiError
 from backend.core.time import ensure_utc, utc_now
 from backend.identity.dependencies import CurrentUser, get_db_session
-from backend.identity.models import EmployeeProfile
+from backend.identity.models import EmployeeProfile, User
 from backend.operations.models import (
     AttendanceRecord,
+    ObjectCalendarDay,
     TariffHistory,
     WorkDay,
     WorkSchedule,
@@ -284,7 +285,7 @@ async def update_work_day(
     values = payload.model_dump(exclude_unset=True)
     check_in = values.get("check_in", item.check_in)
     check_out = values.get("check_out", item.check_out)
-    if check_in and check_out and check_out <= check_in:
+    if check_in and check_out and ensure_utc(check_out) <= ensure_utc(check_in):
         raise ApiError(422, "invalid_work_time", "Check-out must be after check-in")
     for field, value in values.items():
         setattr(item, field, value)
@@ -385,7 +386,16 @@ async def create_tariff(
 
 
 async def schedule_projection(session: AsyncSession, item: WorkSchedule) -> ScheduleRead:
+    exception = await session.scalar(
+        select(ObjectCalendarDay).where(
+            ObjectCalendarDay.object_id == item.object_id,
+            ObjectCalendarDay.work_date == item.work_date,
+            ObjectCalendarDay.archived_at.is_(None),
+        )
+    )
     return ScheduleRead(
+        approved=item.approved,
+        is_working_day=item.is_working_day and (exception is None or exception.is_working_day),
         id=item.id,
         worker_user_id=item.worker_user_id,
         worker_name=await worker_name(session, item.worker_user_id),
@@ -566,6 +576,7 @@ async def create_attendance(
     current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKDAY_MANAGE))],
 ) -> AttendanceRead:
     await require_worker(session, payload.worker_user_id)
+    await session.scalar(select(User).where(User.id == payload.worker_user_id).with_for_update())
     now = utc_now()
     item = AttendanceRecord(
         **payload.model_dump(),
@@ -597,10 +608,12 @@ async def update_attendance(
     item = await session.get(AttendanceRecord, item_id)
     if item is None or item.archived_at is not None:
         raise ApiError(404, "attendance_not_found", "Attendance was not found")
+    await session.scalar(select(User).where(User.id == item.worker_user_id).with_for_update())
+    await session.refresh(item, with_for_update=True)
     values = payload.model_dump(exclude_unset=True)
     check_in = values.get("check_in", item.check_in)
     check_out = values.get("check_out", item.check_out)
-    if check_in and check_out and check_out <= check_in:
+    if check_in and check_out and ensure_utc(check_out) <= ensure_utc(check_in):
         raise ApiError(422, "invalid_attendance_time", "Check-out must be after check-in")
     for field, value in values.items():
         setattr(item, field, value)
@@ -621,8 +634,11 @@ async def archive_attendance(
     item = await session.get(AttendanceRecord, item_id)
     if item is None or item.archived_at is not None:
         raise ApiError(404, "attendance_not_found", "Attendance was not found")
+    await session.scalar(select(User).where(User.id == item.worker_user_id).with_for_update())
+    await session.refresh(item, with_for_update=True)
     item.archived_at = item.updated_at = utc_now()
     item.updated_by = current.id
     audit(request, session, current, "ATTENDANCE_ARCHIVED", "attendance", item.id)
+    await sync_attendance_rating(session, item.worker_user_id, current.id)
     await session.commit()
     return Response(status_code=204)

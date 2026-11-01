@@ -27,6 +27,7 @@ class CurrentUser:
 
 async def get_db_session(request: Request):
     async with request.app.state.database.session_factory() as session:
+        session.info["audit_request_id"] = getattr(request.state, "request_id", None)
         yield session
 
 
@@ -61,12 +62,15 @@ async def get_current_user(
     user, auth_session = row
     if (
         user.status is not AccountStatus.ACTIVE
+        or user.archived_at is not None
         or user.auth_version != auth_version
         or user.role is not token_role
         or auth_session.revoked_at is not None
         or ensure_utc(auth_session.expires_at) <= utc_now()
     ):
         raise ApiError(401, "invalid_token", "Authentication session is no longer active")
+    session.info["audit_actor_id"] = user.id
+    session.info["audit_actor_role"] = user.role.value
     return CurrentUser(
         id=user.id,
         role=user.role,

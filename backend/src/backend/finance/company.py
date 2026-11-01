@@ -184,14 +184,31 @@ async def archive_revenue(
     return Response(status_code=204)
 
 
+class ExpenseApproval(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_revision: int = Field(ge=0)
+    reason: str = Field(default="Подтверждение расхода", min_length=3, max_length=2000)
+
+
 @router.post("/boss/expenses/{item_id}/approve")
 async def approve_expense(
-    item_id: UUID, session: Session, actor: ExpenseApprover, request: Request
+    item_id: UUID,
+    payload: ExpenseApproval,
+    session: Session,
+    actor: ExpenseApprover,
+    request: Request,
 ) -> dict[str, str]:
     item = await session.scalar(select(Expense).where(Expense.id == item_id).with_for_update())
     if item is None or item.archived_at is not None:
         raise ApiError(404, "expense_not_found", "Expense was not found")
+    if payload.expected_revision != item.revision:
+        if item.status == "APPROVED" and payload.expected_revision == item.revision - 1:
+            return {"status": item.status}
+        raise ApiError(
+            409, "stale_expense", "Expense changed; load the latest record before approval"
+        )
     if item.status != "APPROVED":
+        item.revision += 1
         item.status, item.updated_by, item.updated_at = "APPROVED", actor.id, utc_now()
         audit(
             session,
@@ -201,10 +218,15 @@ async def approve_expense(
             "expense",
             item.id,
             {"status": "DRAFT"},
-            {"status": "APPROVED"},
+            {"status": "APPROVED", "reason": payload.reason, "revision": item.revision},
         )
         await session.commit()
     return {"status": item.status}
+
+
+class ExpenseCategoryTotal(BaseModel):
+    category: str
+    amount: Decimal
 
 
 class FinanceTotal(BaseModel):
@@ -212,6 +234,7 @@ class FinanceTotal(BaseModel):
     approved_revenue: Decimal
     approved_expenses: Decimal
     net_profit: Decimal
+    expense_breakdown: list[ExpenseCategoryTotal] = Field(default_factory=list)
 
 
 async def finance_totals(
@@ -224,6 +247,7 @@ async def finance_totals(
     if date_from and date_to and date_to < date_from:
         raise ApiError(422, "invalid_date_range", "End date must follow start date")
     totals = []
+    breakdown: dict[str, list[ExpenseCategoryTotal]] = {}
     for model, date_field in ((Revenue, Revenue.revenue_date), (Expense, Expense.expense_date)):
         query = select(model.currency, func.sum(model.amount)).where(
             model.archived_at.is_(None), model.status == "APPROVED"
@@ -236,10 +260,25 @@ async def finance_totals(
             query = query.where(model.city_id == city_id)
         if object_id:
             query = query.where(model.object_id == object_id)
-        totals.append(dict((await session.execute(query.group_by(model.currency))).all()))
+        if model is Expense:
+            grouped = (
+                query.add_columns(Expense.category)
+                .group_by(Expense.currency, Expense.category)
+                .order_by(Expense.category)
+            )
+            expense_totals: dict[str, Decimal] = {}
+            for currency, amount, category in (await session.execute(grouped)).all():
+                expense_totals[currency] = expense_totals.get(currency, Decimal("0.00")) + amount
+                breakdown.setdefault(currency, []).append(
+                    ExpenseCategoryTotal(category=category, amount=amount)
+                )
+            totals.append(expense_totals)
+        else:
+            totals.append(dict((await session.execute(query.group_by(model.currency))).all()))
     return [
         FinanceTotal(
             currency=currency,
+            expense_breakdown=breakdown.get(currency, []),
             approved_revenue=totals[0].get(currency, Decimal("0.00")),
             approved_expenses=totals[1].get(currency, Decimal("0.00")),
             net_profit=totals[0].get(currency, Decimal("0.00"))
@@ -273,6 +312,83 @@ async def object_finance(
     if await session.get(WorkObject, object_id) is None:
         raise ApiError(404, "object_not_found", "Object was not found")
     return await finance_totals(session, date_from, date_to, None, object_id)
+
+
+@router.get("/boss/finance/object/{object_id}/months", response_model=list[date])
+async def object_finance_months(
+    object_id: UUID,
+    session: Session,
+    _: ProfitReader,
+) -> list[date]:
+    if await session.get(WorkObject, object_id) is None:
+        raise ApiError(404, "object_not_found", "Object was not found")
+    months = set()
+    for model, day in ((Revenue, Revenue.revenue_date), (Expense, Expense.expense_date)):
+        rows = (
+            await session.execute(
+                select(func.extract("year", day), func.extract("month", day))
+                .where(
+                    model.object_id == object_id,
+                    model.status == "APPROVED",
+                    model.archived_at.is_(None),
+                )
+                .distinct()
+            )
+        ).all()
+        months.update(date(int(year), int(month), 1) for year, month in rows)
+    return sorted(months, reverse=True)
+
+
+class ObjectFinanceOperation(BaseModel):
+    id: UUID
+    date: date
+    kind: str
+    category: str
+    comment: str | None
+    amount: Decimal
+    currency: str
+
+
+@router.get(
+    "/boss/finance/object/{object_id}/operations", response_model=list[ObjectFinanceOperation]
+)
+async def object_finance_operations(
+    object_id: UUID,
+    session: Session,
+    _: ProfitReader,
+    date_from: date,
+    date_to: date,
+) -> list[ObjectFinanceOperation]:
+    if date_to < date_from:
+        raise ApiError(422, "invalid_date_range", "End date must follow start date")
+    if await session.get(WorkObject, object_id) is None:
+        raise ApiError(404, "object_not_found", "Object was not found")
+    operations = []
+    for model, day, kind in (
+        (Revenue, Revenue.revenue_date, "income"),
+        (Expense, Expense.expense_date, "expense"),
+    ):
+        items = await session.scalars(
+            select(model).where(
+                model.object_id == object_id,
+                model.archived_at.is_(None),
+                model.status == "APPROVED",
+                day.between(date_from, date_to),
+            )
+        )
+        for item in items:
+            operations.append(
+                ObjectFinanceOperation(
+                    id=item.id,
+                    date=getattr(item, day.key),
+                    kind=kind,
+                    category=item.category,
+                    comment=item.comment,
+                    amount=item.amount,
+                    currency=item.currency,
+                )
+            )
+    return sorted(operations, key=lambda row: (row.date, row.kind, str(row.id)), reverse=True)
 
 
 class BankWrite(BaseModel):

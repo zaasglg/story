@@ -12,10 +12,12 @@ from backend.core.database import Database
 from backend.core.time import utc_now
 from backend.identity.models import AccountStatus, EmployeeProfile, User, UserRole
 from backend.identity.phone import normalize_phone
+from backend.identity.security import hash_password
 
 
 class BootstrapUser(BaseModel):
     phone: str
+    password: str = Field(min_length=8, max_length=128, repr=False)
     role: UserRole
     full_name: str = Field(min_length=1, max_length=255)
     employee_id: str = Field(min_length=1, max_length=64)
@@ -40,10 +42,14 @@ async def seed() -> None:
                         raise RuntimeError(
                             f"Refusing to change role for existing bootstrap user {phone}"
                         )
+                    if existing.password_hash is None:
+                        existing.password_hash = hash_password(item.password)
+                        existing.auth_version += 1
                     continue
                 now = utc_now()
                 user = User(
                     phone=phone,
+                    password_hash=hash_password(item.password),
                     role=item.role,
                     status=AccountStatus.ACTIVE,
                     created_at=now,
@@ -56,7 +62,14 @@ async def seed() -> None:
                         user_id=user.id,
                         full_name=item.full_name,
                         employee_id=item.employee_id,
-                        city=item.city,
+                        city={
+                            "Lipetsk": "Липецк",
+                            "Kursk": "Курск",
+                            "Voronezh": "Воронеж",
+                            "Belgorod": "Белгород",
+                            "Oryol": "Орёл",
+                            "Orel": "Орёл",
+                        }.get(item.city, item.city),
                         created_at=now,
                         updated_at=now,
                     )

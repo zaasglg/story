@@ -4,3 +4,12 @@ __pycache__
 .pytest_cache
 .ruff_cache
 dist
+.secrets
+*service-account*.json
+.git
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.p8

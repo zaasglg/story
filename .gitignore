@@ -1,4 +1,10 @@
 .env
+.secrets/
+**/service-account*.json
+mobile/config/firebase.json
+mobile/web/firebase-config.js
+mobile/android/app/google-services.json
+mobile/ios/Runner/GoogleService-Info.plist
 .DS_Store
 *.log
 *.py[cod]
@@ -14,3 +20,5 @@ mobile/.idea/
 mobile/build/
 mobile/coverage/
 mobile/*.iml
+.env.server
+*.dump

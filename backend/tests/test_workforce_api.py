@@ -81,6 +81,7 @@ async def test_admin_workflow_and_role_safe_projections(context: AppContext) -> 
         "photo_url",
         "city",
         "brigade_name",
+        "position",
     }
     assert public_worker["role"] == "WORKER"
     assert "PASS-SECRET-1917" not in public.text
@@ -98,6 +99,43 @@ async def test_admin_workflow_and_role_safe_projections(context: AppContext) -> 
         json={"brigade_id": brigade_id, "object_id": object_id},
     )
     assert assigned.status_code == 200, assigned.text
+
+    own_team = await context.client.get("/api/v1/workers/me/brigade", headers=auth(worker_tokens))
+    assert own_team.status_code == 200
+    assert own_team.json() == []
+    async with context.database.session_factory() as session:
+        own_id = await session.scalar(
+            select(User.id).where(User.role == UserRole.WORKER, User.id != UUID(worker_id))
+        )
+    own_assigned = await context.client.post(
+        f"/api/v1/admin/workers/{own_id}/assignment",
+        headers=auth(admin_tokens),
+        json={"brigade_id": brigade_id, "object_id": object_id},
+    )
+    assert own_assigned.status_code == 200, own_assigned.text
+    own_team = await context.client.get("/api/v1/workers/me/brigade", headers=auth(worker_tokens))
+    assert own_team.status_code == 200
+    assert {item["id"] for item in own_team.json()} == {str(own_id), worker_id}
+    assert all(set(item) == set(public_worker) | {"is_self"} for item in own_team.json())
+    assert [item["id"] for item in own_team.json() if item["is_self"]] == [str(own_id)]
+    assert "PASS-SECRET-1917" not in own_team.text
+    assert "+77075550101" not in own_team.text
+
+    # A reassignment immediately removes the former colleague from the worker's brigade.
+    other_brigade = await context.client.post(
+        "/api/v1/admin/brigades",
+        headers=auth(admin_tokens),
+        json={"name": "Other brigade", "city_id": city_id, "master_user_id": str(master_id)},
+    )
+    assert other_brigade.status_code == 201
+    moved = await context.client.post(
+        f"/api/v1/admin/workers/{own_id}/assignment",
+        headers=auth(admin_tokens),
+        json={"brigade_id": other_brigade.json()["id"], "object_id": object_id},
+    )
+    assert moved.status_code == 200
+    own_team = await context.client.get("/api/v1/workers/me/brigade", headers=auth(worker_tokens))
+    assert {item["id"] for item in own_team.json()} == {str(own_id)}
 
     team_detail = await context.client.get(
         f"/api/v1/master/team/{worker_id}", headers=auth(master_tokens)

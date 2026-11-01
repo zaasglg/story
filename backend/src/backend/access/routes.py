@@ -1,7 +1,7 @@
 import base64
 import hashlib
 import secrets
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
 from typing import Annotated, Literal
@@ -15,6 +15,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.access.models import PassToken, RatingEvent, WorkAuthorization
+from backend.access.rating import append_rating_event, reversed_event_ids
 from backend.audit.service import add_audit_event
 from backend.authorization.dependencies import require_permission
 from backend.authorization.permissions import Permission
@@ -22,7 +23,7 @@ from backend.core.errors import ApiError
 from backend.core.time import ensure_utc, utc_now
 from backend.equipment.models import EquipmentIssue, EquipmentItem
 from backend.identity.dependencies import CurrentUser, get_db_session
-from backend.identity.models import AccountStatus
+from backend.identity.models import AccountStatus, EmployeeProfile, User, UserRole
 from backend.workforce.models import City
 from backend.workforce.service import active_assignment, require_worker
 
@@ -49,6 +50,45 @@ class AuthorizationCreate(BaseModel):
 class AuthorizationRead(AuthorizationCreate):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
+    revoked_at: datetime | None = None
+
+
+@router.get("/admin/work-authorizations", response_model=list[AuthorizationRead])
+async def list_authorizations(session: Session, _: Manager) -> list[WorkAuthorization]:
+    return list(
+        (
+            await session.scalars(
+                select(WorkAuthorization).order_by(WorkAuthorization.created_at.desc())
+            )
+        ).all()
+    )
+
+
+@router.patch("/admin/work-authorizations/{item_id}", response_model=AuthorizationRead)
+async def update_authorization(
+    item_id: UUID, payload: AuthorizationCreate, session: Session, actor: Manager
+) -> WorkAuthorization:
+    item = await session.scalar(
+        select(WorkAuthorization).where(WorkAuthorization.id == item_id).with_for_update()
+    )
+    if item is None:
+        raise ApiError(404, "authorization_not_found", "Work authorization was not found")
+    if item.revoked_at is not None:
+        raise ApiError(409, "authorization_revoked", "Revoked authorization cannot be changed")
+    if payload.worker_user_id != item.worker_user_id:
+        raise ApiError(422, "authorization_worker_mismatch", "Worker cannot be changed")
+    for field in ("valid_from", "valid_until", "reference"):
+        setattr(item, field, getattr(payload, field))
+    add_audit_event(
+        session,
+        actor_user_id=actor.id,
+        action="WORK_AUTHORIZATION_UPDATED",
+        entity_type="work_authorization",
+        entity_id=item.id,
+        new_value=payload.model_dump(mode="json"),
+    )
+    await session.commit()
+    return item
 
 
 @router.post("/admin/work-authorizations", response_model=AuthorizationRead, status_code=201)
@@ -96,13 +136,14 @@ async def pass_details(session: AsyncSession, worker_id: UUID) -> dict:
     city = await session.get(City, profile.city_id) if profile.city_id else None
     today = utc_now().astimezone(ZoneInfo(city.timezone if city else "Europe/Moscow")).date()
     valid = await session.scalar(
-        select(WorkAuthorization.id)
+        select(WorkAuthorization)
         .where(
             WorkAuthorization.worker_user_id == worker_id,
             WorkAuthorization.revoked_at.is_(None),
             WorkAuthorization.valid_from <= today,
             WorkAuthorization.valid_until >= today,
         )
+        .order_by(WorkAuthorization.valid_until.desc(), WorkAuthorization.created_at.desc())
         .limit(1)
     )
     active = worker.status == AccountStatus.ACTIVE and valid is not None
@@ -122,6 +163,12 @@ async def pass_details(session: AsyncSession, worker_id: UUID) -> dict:
         "brigade": assignment.brigade.name if assignment else None,
         "employee_id": profile.employee_id,
         "photo_url": profile.photo_url,
+        "object_name": assignment.work_object.name
+        if assignment and assignment.work_object
+        else None,
+        "valid_from": valid.valid_from if valid else None,
+        "valid_until": valid.valid_until if valid else None,
+        "rating": (await rating_details(session, worker_id))["rating"],
         "status": "ACTIVE" if active else "BLOCKED",
         "permissions": ["WORK_ENTRY"] if active else [],
         "issued_equipment": [{"name": row[0], "quantity": row[1]} for row in items],
@@ -145,6 +192,7 @@ async def own_pass(session: Session, actor: Own) -> dict:
     qrcode.make(token).save(png, format="PNG")
     return {
         **details,
+        "phone": (await require_worker(session, actor.id)).phone,
         "qr_payload": token,
         "qr_png_base64": base64.b64encode(png.getvalue()).decode(),
         "expires_at": expiry,
@@ -212,6 +260,13 @@ class RatingEventRead(BaseModel):
     delta: Decimal
     reason: str
     photo_url: str | None
+    reversed: bool = False
+    created_at: datetime
+    created_by: UUID | None
+    source: str
+    actor_name: str | None = None
+    rating_before: Decimal | None
+    rating_after: Decimal | None
 
 
 async def rating_details(session: AsyncSession, worker_id: UUID) -> dict:
@@ -222,10 +277,33 @@ async def rating_details(session: AsyncSession, worker_id: UUID) -> dict:
             .order_by(RatingEvent.event_date, RatingEvent.created_at, RatingEvent.id)
         )
     ).all()
+    authors = dict(
+        (
+            await session.execute(
+                select(EmployeeProfile.user_id, EmployeeProfile.full_name).where(
+                    EmployeeProfile.user_id.in_({row.created_by for row in rows if row.created_by})
+                )
+            )
+        ).all()
+    )
     rating = Decimal("5.0")
+    cancelled = reversed_event_ids(rows)
     for row in rows:
+        if str(row.id) in cancelled or row.event_type == "ATTENDANCE_REVERSED":
+            continue
         rating = max(Decimal("0"), min(Decimal("5"), rating + row.delta))
-    return {"rating": rating, "history": [RatingEventRead.model_validate(row) for row in rows]}
+    return {
+        "rating": rating,
+        "history": [
+            RatingEventRead.model_validate(row).model_copy(
+                update={
+                    "reversed": str(row.id) in cancelled,
+                    "actor_name": authors.get(row.created_by) if row.created_by else "Система",
+                }
+            )
+            for row in rows
+        ],
+    }
 
 
 @router.post("/admin/rating-events", response_model=RatingEventRead, status_code=201)
@@ -235,6 +313,7 @@ async def violation(
     actor: Annotated[CurrentUser, Depends(require_permission(Permission.WORKDAY_MANAGE))],
 ) -> RatingEvent:
     await require_worker(session, payload.worker_user_id)
+    await session.scalar(select(User).where(User.id == payload.worker_user_id).with_for_update())
     item = RatingEvent(
         **payload.model_dump(),
         delta=DELTAS[payload.event_type],
@@ -242,8 +321,7 @@ async def violation(
         created_by=actor.id,
         created_at=utc_now(),
     )
-    session.add(item)
-    await session.flush()
+    await append_rating_event(session, item)
     add_audit_event(
         session,
         actor_user_id=actor.id,
@@ -265,7 +343,9 @@ async def own_rating(session: Session, actor: Own) -> dict:
 async def public_rating(
     worker_id: UUID,
     session: Session,
-    _: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_PUBLIC_READ))],
+    actor: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_PUBLIC_READ))],
 ) -> dict:
-    await require_worker(session, worker_id)
+    worker = await require_worker(session, worker_id)
+    if actor.role == UserRole.MASTER and worker.profile.master_user_id != actor.id:
+        raise ApiError(404, "worker_not_found", "Worker was not found")
     return await rating_details(session, worker_id)

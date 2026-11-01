@@ -2,11 +2,37 @@ from conftest import AppContext, login
 from sqlalchemy import func, select
 
 from backend.communications.models import SupportTicket
-from backend.identity.models import AuditLog, User, UserRole
+from backend.identity.models import AccountStatus, AuditLog, User, UserRole
 
 
 def auth(tokens):
     return {"Authorization": f"Bearer {tokens['access_token']}"}
+
+
+async def test_chat_contact_search_and_privacy(context: AppContext) -> None:
+    worker = auth(await login(context, UserRole.WORKER))
+    path = "/api/v1/chats/contacts"
+    contacts = await context.client.get(path, headers=worker)
+    assert contacts.status_code == 200
+    assert len(contacts.json()) == 3
+    assert all(set(item) == {"id", "full_name", "role"} for item in contacts.json())
+    assert all(item["role"] != "WORKER" for item in contacts.json())
+    found = await context.client.get(path, headers=worker, params={"q": "mAsTeR"})
+    assert [item["role"] for item in found.json()] == ["MASTER"]
+    master_id = found.json()[0]["id"]
+    first = await context.client.post(f"/api/v1/chats/direct/{master_id}", headers=worker)
+    second = await context.client.post(f"/api/v1/chats/direct/{master_id}", headers=worker)
+    assert first.json()["id"] == second.json()["id"]
+    page = await context.client.get(path, headers=worker, params={"limit": 1, "offset": 1})
+    assert len(page.json()) == 1
+    async with context.database.session_factory() as session:
+        master = await session.scalar(select(User).where(User.role == UserRole.MASTER))
+        master.status = AccountStatus.BLOCKED
+        await session.commit()
+    found = await context.client.get(path, headers=worker, params={"q": "Master"})
+    assert found.json() == []
+    denied = await context.client.post(f"/api/v1/chats/direct/{master_id}", headers=worker)
+    assert denied.status_code == 404
 
 
 async def test_private_chat_scope_and_message_idempotency(context: AppContext) -> None:
@@ -17,6 +43,8 @@ async def test_private_chat_scope_and_message_idempotency(context: AppContext) -
         master_id = await session.scalar(select(User.id).where(User.role == UserRole.MASTER))
     created = await context.client.post(f"/api/v1/chats/direct/{master_id}", headers=worker)
     assert created.status_code == 200
+    assert created.json()["peer_name"]
+    assert created.json()["peer_role"] == "MASTER"
     thread_id = created.json()["id"]
     assigned_chat = await context.client.post("/api/v1/chats/manager", headers=worker)
     assert assigned_chat.status_code == 200
@@ -27,6 +55,9 @@ async def test_private_chat_scope_and_message_idempotency(context: AppContext) -
     payload = {"client_message_id": "message-one", "body": "Private worker message"}
     sent = await context.client.post(path, headers=worker, json=payload)
     assert sent.status_code == 201
+    assert sent.json()["sender_name"] == "Worker User"
+    assert sent.json()["sender_role"] == "WORKER"
+    assert sent.json()["is_own"] is True
     replay = await context.client.post(path, headers=worker, json=payload)
     assert replay.json()["id"] == sent.json()["id"]
     conflict = await context.client.post(
@@ -35,6 +66,15 @@ async def test_private_chat_scope_and_message_idempotency(context: AppContext) -
     assert conflict.status_code == 409
     own = await context.client.get(path, headers=master)
     assert own.json()[0]["body"] == payload["body"]
+    assert own.json()[0]["sender_name"] == "Worker User"
+    assert own.json()[0]["is_own"] is False
+    worker_chats = await context.client.get("/api/v1/chats", headers=worker)
+    assert worker_chats.json()[0]["id"] == thread_id
+    assert worker_chats.json()[0]["last_message"] == payload["body"]
+    master_chats = await context.client.get("/api/v1/chats", headers=master)
+    assert master_chats.json()[0]["peer_role"] == "WORKER"
+    admin_chats = await context.client.get("/api/v1/chats", headers=admin)
+    assert thread_id not in {row["id"] for row in admin_chats.json()}
     for method in ("get", "post"):
         denied = await getattr(context.client, method)(
             path, headers=admin, **({"json": payload} if method == "post" else {})
@@ -84,7 +124,19 @@ async def test_announcements_and_support_role_scope(context: AppContext) -> None
     )
     assert resolved.json()["status"] == "RESOLVED"
     chats = await context.client.get("/api/v1/chats", headers=worker)
-    assert any(item["key"] == "GENERAL" for item in chats.json())
+    assert all(item["key"] != "GENERAL" for item in chats.json())
+    chats = await context.client.get("/api/v1/chats", headers=admin)
+    general_id = next(item["id"] for item in chats.json() if item["key"] == "GENERAL")
+    sent = await context.client.post(
+        f"/api/v1/chats/{general_id}/messages",
+        headers=master,
+        json={"client_message_id": "general-author", "body": "Hello team"},
+    )
+    assert sent.status_code == 201
+    received = await context.client.get(f"/api/v1/chats/{general_id}/messages", headers=admin)
+    assert received.json()[0]["sender_name"] == "Master User"
+    assert received.json()[0]["sender_role"] == "MASTER"
+    assert received.json()[0]["is_own"] is False
 
 
 async def test_support_retry_validation_and_queue_scope(context: AppContext) -> None:

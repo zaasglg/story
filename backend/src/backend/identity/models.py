@@ -38,6 +38,7 @@ class User(Base):
         default=AccountStatus.ACTIVE,
         nullable=False,
     )
+    password_hash: Mapped[str | None] = mapped_column(String(255))
     auth_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -52,6 +53,8 @@ class User(Base):
 
 
 class EmployeeProfile(Base):
+    position: Mapped[str | None] = mapped_column(String(128))
+
     __tablename__ = "employee_profiles"
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
@@ -117,6 +120,9 @@ class AuthSession(Base):
 
 
 class AuditLog(Base):
+    actor_role: Mapped[str | None] = mapped_column(String(16))
+    reason: Mapped[str | None] = mapped_column(Text)
+
     __tablename__ = "audit_logs"
     __table_args__ = (
         Index("ix_audit_logs_actor_created", "actor_user_id", "created_at"),

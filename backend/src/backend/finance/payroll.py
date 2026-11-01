@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import UUID
@@ -12,10 +12,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.audit.service import add_audit_event
 from backend.authorization.dependencies import require_permission
 from backend.authorization.permissions import Permission
+from backend.communications.models import Notification
+from backend.communications.push import stage_notifications
 from backend.core.errors import ApiError
 from backend.core.time import utc_now
 from backend.finance.models import FinancialRequest, LedgerCorrection, LedgerEntry
+from backend.finance.payroll_costs import sync_payroll_cost
 from backend.identity.dependencies import CurrentUser, get_db_session
+from backend.identity.models import AccountStatus, EmployeeProfile, User, UserRole
 from backend.operations.models import WorkDay, WorkDayStatus
 from backend.workforce.service import require_worker
 
@@ -23,6 +27,53 @@ router = APIRouter(tags=["payroll"])
 Session = Annotated[AsyncSession, Depends(get_db_session)]
 Creator = Annotated[CurrentUser, Depends(require_permission(Permission.FINANCIAL_REQUEST_CREATE))]
 Approver = Annotated[CurrentUser, Depends(require_permission(Permission.FINANCIAL_REQUEST_APPROVE))]
+
+
+FINANCIAL_REQUEST_LABELS = {
+    "SALARY": "Зарплата",
+    "BONUS": "Бонус",
+    "PENALTY": "Штраф",
+    "ADVANCE": "Аванс",
+    "PAYMENT": "Выплата",
+    "SALARY_CHANGE": "Изменение зарплаты",
+}
+
+
+async def notify_approvers(session: AsyncSession, item: FinancialRequest) -> None:
+    worker_name = await session.scalar(
+        select(EmployeeProfile.full_name).where(EmployeeProfile.user_id == item.worker_user_id)
+    )
+    bosses = (
+        await session.scalars(
+            select(User.id).where(
+                User.role == UserRole.BOSS,
+                User.status == AccountStatus.ACTIVE,
+                User.archived_at.is_(None),
+            )
+        )
+    ).all()
+    sign = {"BONUS": "+", "PENALTY": "−"}.get(item.type, "")
+    amount = (
+        f"Текущая: {item.expected_amount} {item.currency}\nНовая: {item.amount} {item.currency}"
+        if item.type == "SALARY_CHANGE"
+        else f"Сумма: {sign}{item.amount} {item.currency}"
+    )
+    await stage_notifications(
+        session,
+        [
+            Notification(
+                recipient_user_id=boss_id,
+                title="Запрос на изменение зарплаты"
+                if item.type == "SALARY_CHANGE"
+                else f"{FINANCIAL_REQUEST_LABELS[item.type]} на согласовании",
+                body=f"{worker_name or 'Сотрудник'}\nМесяц: {item.period:%m.%Y}\n{amount}\n"
+                f"Причина: {item.reason}\n"
+                "Откройте раздел «Согласование выплат», чтобы принять решение.",
+                created_at=utc_now(),
+            )
+            for boss_id in bosses
+        ],
+    )
 
 
 async def calculated_salary(
@@ -43,7 +94,7 @@ async def calculated_salary(
 
 
 class RequestCreate(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     worker_user_id: UUID
     type: Literal["SALARY", "BONUS", "PENALTY", "ADVANCE", "PAYMENT"]
     amount: Decimal = Field(gt=0, max_digits=14, decimal_places=2)
@@ -59,6 +110,11 @@ class RequestCreate(BaseModel):
 
 
 class RequestRead(RequestCreate):
+    type: Literal["SALARY", "BONUS", "PENALTY", "ADVANCE", "PAYMENT", "SALARY_CHANGE"]
+    amount: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
+    ledger_entry_id: UUID | None = None
+    expected_amount: Decimal | None = None
+    expected_revision: int | None = None
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     status: str
@@ -109,6 +165,7 @@ async def create_request(
         raise ApiError(
             409, "request_conflict", "Request already exists; retry with the same key"
         ) from exc
+    await notify_approvers(session, item)
     add_audit_event(
         session,
         actor_user_id=actor.id,
@@ -177,17 +234,103 @@ async def decide(
     )
     if result.scalar_one_or_none() is None:
         raise ApiError(409, "request_decided", "Request has already been decided")
-    if approve:
-        session.add(
-            LedgerEntry(
-                request_id=item.id,
-                worker_user_id=item.worker_user_id,
-                type=item.type,
-                amount=item.amount,
-                currency=item.currency,
-                period=item.period,
-                created_at=utc_now(),
-            )
+    if approve and item.type == "SALARY_CHANGE":
+        entry = await session.scalar(
+            select(LedgerEntry).where(LedgerEntry.id == item.ledger_entry_id).with_for_update()
+        )
+        if entry is None or entry.type != "SALARY":
+            raise ApiError(409, "stale_correction", "Salary entry is unavailable")
+        last = await latest_correction(session, entry.id)
+        current = last.new_amount if last else entry.amount
+        revision = last.revision if last else 0
+        if current != item.expected_amount or revision != item.expected_revision:
+            raise ApiError(409, "stale_salary_request", "Salary changed; submit a new request")
+        correction = LedgerCorrection(
+            ledger_entry_id=entry.id,
+            revision=revision + 1,
+            old_amount=current,
+            new_amount=item.amount,
+            reason=item.reason,
+            actor_user_id=actor.id,
+            idempotency_key=f"salary-change:{item.id}",
+            created_at=utc_now(),
+        )
+        session.add(correction)
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            await session.rollback()
+            raise ApiError(
+                409, "correction_conflict", "Salary changed; reload before approving"
+            ) from exc
+        add_audit_event(
+            session,
+            actor_user_id=actor.id,
+            action="PAYROLL_CORRECTED",
+            entity_type="ledger_correction",
+            entity_id=correction.id,
+            old_value={"amount": str(current)},
+            new_value={
+                "amount": str(item.amount),
+                "financial_request_id": str(item.id),
+                "ledger_entry_id": str(entry.id),
+                "reason": item.reason,
+            },
+            request_id=getattr(request.state, "request_id", None),
+        )
+    elif approve:
+        entry = LedgerEntry(
+            cost_integrated=True,
+            request_id=item.id,
+            worker_user_id=item.worker_user_id,
+            type=item.type,
+            amount=item.amount,
+            currency=item.currency,
+            period=item.period,
+            created_at=utc_now(),
+        )
+        session.add(entry)
+    try:
+        # Validate the ledger insert before notification queries can autoflush it.
+        await session.flush()
+        if approve:
+            await sync_payroll_cost(session, entry, item.amount, actor.id)
+    except IntegrityError as exc:
+        await session.rollback()
+        raise ApiError(
+            409, "ledger_conflict", "Salary for this period has already been posted"
+        ) from exc
+    if item.type in FINANCIAL_REQUEST_LABELS:
+        worker_name = await session.scalar(
+            select(EmployeeProfile.full_name).where(EmployeeProfile.user_id == item.worker_user_id)
+        )
+        await stage_notifications(
+            session,
+            [
+                Notification(
+                    recipient_user_id=item.created_by,
+                    title=(
+                        "Изменение зарплаты одобрено" if approve else "Изменение зарплаты отклонено"
+                    )
+                    if item.type == "SALARY_CHANGE"
+                    else (
+                        "Финансовая заявка одобрена" if approve else "Финансовая заявка отклонена"
+                    ),
+                    body=f"{worker_name or 'Сотрудник'}\nМесяц: {item.period:%m.%Y}\n"
+                    + (
+                        f"{item.expected_amount} → {item.amount} {item.currency}. "
+                        if item.type == "SALARY_CHANGE"
+                        else f"{FINANCIAL_REQUEST_LABELS[item.type]}: "
+                        f"{item.amount} {item.currency}. "
+                    )
+                    + (
+                        "Одобрено и учтено в расчёте."
+                        if approve
+                        else "Отклонено. В расчёт не включено."
+                    ),
+                    created_at=utc_now(),
+                )
+            ],
         )
     add_audit_event(
         session,
@@ -269,6 +412,17 @@ class PayrollRead(BaseModel):
     payment: Decimal
     monthly_pay: Decimal
     remaining: Decimal
+
+
+class WorkerFinanceHistoryRead(BaseModel):
+    id: UUID
+    type: Literal["SALARY", "BONUS", "PENALTY", "ADVANCE", "PAYMENT"]
+    amount: Decimal
+    currency: str
+    period: date
+    reason: str
+    created_at: datetime
+    corrected: bool
 
 
 class SalaryCalculation(BaseModel):
@@ -360,6 +514,61 @@ async def own_payroll(
     actor: Annotated[CurrentUser, Depends(require_permission(Permission.WORKDAY_READ_OWN))],
 ) -> list[PayrollRead]:
     return await payroll(session, period, actor.id)
+
+
+@router.get("/workers/me/finance/history", response_model=list[WorkerFinanceHistoryRead])
+async def own_finance_history(
+    period: date,
+    session: Session,
+    actor: Annotated[CurrentUser, Depends(require_permission(Permission.WORKDAY_READ_OWN))],
+) -> list[WorkerFinanceHistoryRead]:
+    rows = list(
+        (
+            await session.scalars(
+                select(LedgerEntry)
+                .where(
+                    LedgerEntry.worker_user_id == actor.id,
+                    LedgerEntry.period == period,
+                )
+                .order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc())
+            )
+        ).all()
+    )
+    if not rows:
+        return []
+    corrections = list(
+        (
+            await session.scalars(
+                select(LedgerCorrection)
+                .where(LedgerCorrection.ledger_entry_id.in_([row.id for row in rows]))
+                .order_by(LedgerCorrection.revision)
+            )
+        ).all()
+    )
+    corrected = {item.ledger_entry_id: item.new_amount for item in corrections}
+    requests = {
+        item.id: item
+        for item in (
+            await session.scalars(
+                select(FinancialRequest).where(
+                    FinancialRequest.id.in_([row.request_id for row in rows])
+                )
+            )
+        ).all()
+    }
+    return [
+        WorkerFinanceHistoryRead(
+            id=row.id,
+            type=row.type,
+            amount=corrected.get(row.id, row.amount),
+            currency=row.currency,
+            period=row.period,
+            reason=requests[row.request_id].reason,
+            created_at=row.created_at,
+            corrected=row.id in corrected,
+        )
+        for row in rows
+    ]
 
 
 class CorrectionCreate(BaseModel):
@@ -454,6 +663,7 @@ async def correct_entry(
             },
             request_id=getattr(request.state, "request_id", None),
         )
+        await sync_payroll_cost(session, entry, payload.new_amount, actor.id)
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
@@ -499,3 +709,241 @@ async def ledger_list(period: date, session: Session, _: Approver) -> list[Ledge
             )
         ).all()
     )
+
+
+async def latest_correction(session: AsyncSession, entry_id: UUID) -> LedgerCorrection | None:
+    return await session.scalar(
+        select(LedgerCorrection)
+        .where(LedgerCorrection.ledger_entry_id == entry_id)
+        .order_by(LedgerCorrection.revision.desc())
+        .limit(1)
+    )
+
+
+class SalaryChangeCreate(CorrectionCreate):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    expected_revision: int = Field(ge=0)
+
+
+class AdminSalaryRead(LedgerRead):
+    worker_name: str
+    original_amount: Decimal
+    expected_revision: int
+    status: str
+
+
+@router.get("/admin/salary-ledger", response_model=list[AdminSalaryRead])
+async def admin_salary_ledger(
+    session: Session,
+    _: Creator,
+    limit: Annotated[int, Query(ge=1, le=100)] = 25,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    q: Annotated[str, Query(max_length=200)] = "",
+) -> list[AdminSalaryRead]:
+    rows = (
+        await session.execute(
+            select(LedgerEntry, EmployeeProfile.full_name)
+            .join(EmployeeProfile, EmployeeProfile.user_id == LedgerEntry.worker_user_id)
+            .where(
+                LedgerEntry.type == "SALARY",
+                EmployeeProfile.full_name.icontains(q.strip(), autoescape=True),
+            )
+            .order_by(LedgerEntry.period.desc(), LedgerEntry.id)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    pending = set(
+        (
+            await session.scalars(
+                select(FinancialRequest.ledger_entry_id).where(
+                    FinancialRequest.type == "SALARY_CHANGE",
+                    FinancialRequest.status == "PENDING_BOSS",
+                )
+            )
+        ).all()
+    )
+    result = []
+    for entry, name in rows:
+        last = await latest_correction(session, entry.id)
+        result.append(
+            AdminSalaryRead(
+                **LedgerRead.model_validate(entry).model_dump(exclude={"amount"}),
+                amount=last.new_amount if last else entry.amount,
+                original_amount=entry.amount,
+                worker_name=name,
+                expected_revision=last.revision if last else 0,
+                status="PENDING_BOSS" if entry.id in pending else "APPROVED",
+            )
+        )
+    return result
+
+
+@router.post(
+    "/admin/salary-ledger/{entry_id}/change-requests", response_model=RequestRead, status_code=201
+)
+async def request_salary_change(
+    entry_id: UUID,
+    payload: SalaryChangeCreate,
+    session: Session,
+    actor: Creator,
+    request: Request,
+    key: Annotated[str, Header(alias="Idempotency-Key", min_length=1, max_length=128)],
+) -> FinancialRequest:
+    replay = await session.scalar(
+        select(FinancialRequest).where(
+            FinancialRequest.created_by == actor.id, FinancialRequest.idempotency_key == key
+        )
+    )
+    if replay:
+        if (
+            replay.type != "SALARY_CHANGE"
+            or replay.ledger_entry_id != entry_id
+            or replay.amount != payload.new_amount
+            or replay.expected_amount != payload.expected_amount
+            or replay.expected_revision != payload.expected_revision
+            or replay.reason != payload.reason
+        ):
+            raise ApiError(409, "idempotency_conflict", "Key was already used for another request")
+        return replay
+    entry = await session.scalar(
+        select(LedgerEntry)
+        .where(LedgerEntry.id == entry_id, LedgerEntry.type == "SALARY")
+        .with_for_update()
+    )
+    if entry is None:
+        raise ApiError(404, "ledger_entry_not_found", "Salary entry was not found")
+    last = await latest_correction(session, entry.id)
+    current = last.new_amount if last else entry.amount
+    revision = last.revision if last else 0
+    if current != payload.expected_amount or revision != payload.expected_revision:
+        raise ApiError(409, "stale_salary_request", "Salary changed; submit a new request")
+    if current == payload.new_amount:
+        raise ApiError(422, "unchanged_amount", "New salary must differ")
+    if not payload.reason.strip():
+        raise ApiError(422, "invalid_reason", "Provide a reason")
+    item = FinancialRequest(
+        worker_user_id=entry.worker_user_id,
+        type="SALARY_CHANGE",
+        amount=payload.new_amount,
+        expected_amount=current,
+        expected_revision=revision,
+        ledger_entry_id=entry.id,
+        period=entry.period,
+        currency=entry.currency,
+        reason=payload.reason.strip(),
+        created_by=actor.id,
+        idempotency_key=key,
+        status="PENDING_BOSS",
+        created_at=utc_now(),
+    )
+    session.add(item)
+    try:
+        await session.flush()
+        await notify_approvers(session, item)
+        add_audit_event(
+            session,
+            actor_user_id=actor.id,
+            action="SALARY_CHANGE_REQUESTED",
+            entity_type="financial_request",
+            entity_id=item.id,
+            old_value={"amount": str(current), "revision": revision},
+            new_value={
+                "amount": str(item.amount),
+                "ledger_entry_id": str(entry.id),
+                "status": item.status,
+                "reason": item.reason,
+            },
+            request_id=getattr(request.state, "request_id", None),
+        )
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise ApiError(409, "pending_salary_change", "A salary change is already pending") from exc
+    return item
+
+
+class PayrollExpenseLinks(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expense_ids: list[UUID] = Field(min_length=1, max_length=100)
+    expected_amount: Decimal = Field(ge=0, max_digits=14, decimal_places=2)
+    expected_revision: int = Field(ge=0)
+
+
+@router.post("/boss/ledger/{entry_id}/expense-links")
+async def reconcile_payroll_expenses(
+    entry_id: UUID,
+    payload: PayrollExpenseLinks,
+    session: Session,
+    actor: Approver,
+) -> dict:
+    """Explicitly link already-booked legacy costs; never infer or rewrite money."""
+    from backend.finance.models import Expense
+
+    entry = await session.scalar(
+        select(LedgerEntry).where(LedgerEntry.id == entry_id).with_for_update()
+    )
+    if entry is None or entry.type not in ("SALARY", "BONUS", "PENALTY"):
+        raise ApiError(404, "ledger_entry_not_found", "Payroll accrual entry was not found")
+    last = await latest_correction(session, entry.id)
+    amount, revision = (last.new_amount, last.revision) if last else (entry.amount, 0)
+    if amount != payload.expected_amount or revision != payload.expected_revision:
+        raise ApiError(409, "stale_correction", "Payroll changed; reload before reconciliation")
+    existing = list(
+        (await session.scalars(select(Expense).where(Expense.payroll_entry_id == entry.id))).all()
+    )
+    if existing:
+        if {e.id for e in existing} == set(payload.expense_ids):
+            return {"status": "LINKED", "expense_ids": [e.id for e in existing]}
+        raise ApiError(
+            409,
+            "payroll_cost_already_linked",
+            "Entry already has linked costs; do not book it twice",
+        )
+    expenses = list(
+        (
+            await session.scalars(
+                select(Expense)
+                .where(Expense.id.in_(payload.expense_ids))
+                .order_by(Expense.id)
+                .with_for_update()
+            )
+        ).all()
+    )
+    expected = -amount if entry.type == "PENALTY" else amount
+    if (
+        len(expenses) != len(set(payload.expense_ids))
+        or not expenses
+        or len({(e.object_id, e.city_id) for e in expenses}) != len(expenses)
+        or sum(e.amount for e in expenses) != expected
+        or any(
+            e.payroll_entry_id is not None
+            or e.archived_at is not None
+            or e.status != "APPROVED"
+            or e.currency != entry.currency
+            or (e.expense_date.year, e.expense_date.month)
+            != (entry.period.year, entry.period.month)
+            or e.category not in ("salary", "bonus")
+            for e in expenses
+        )
+    ):
+        raise ApiError(
+            422,
+            "payroll_reconciliation_mismatch",
+            "Select distinct approved payroll costs matching amount, currency, "
+            "period and object allocations",
+        )
+    for expense in expenses:
+        expense.payroll_entry_id = entry.id
+        expense.payroll_source_key = f"{entry.id}:{expense.object_id or expense.city_id}"
+    entry.cost_integrated = True
+    add_audit_event(
+        session,
+        actor_user_id=actor.id,
+        action="PAYROLL_EXPENSES_LINKED",
+        entity_type="ledger_entry",
+        entity_id=entry.id,
+        new_value={"amount": str(amount), "source": "explicit_reconciliation"},
+    )
+    await session.commit()
+    return {"status": "LINKED", "expense_ids": [e.id for e in expenses]}

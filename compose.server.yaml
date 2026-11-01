@@ -1,0 +1,93 @@
+name: alash-production
+
+x-api-environment: &api-environment
+  M1917_ENVIRONMENT: production
+  M1917_DATABASE_URL: postgresql+asyncpg://alash:${POSTGRES_PASSWORD:?Generate .env.server}@postgres:5432/alash
+  M1917_REDIS_URL: redis://redis:6379/0
+  M1917_JWT_SECRET: ${M1917_JWT_SECRET:?Generate .env.server}
+  M1917_OTP_PEPPER: ${M1917_OTP_PEPPER:?Generate .env.server}
+  M1917_PII_ENCRYPTION_KEY: ${M1917_PII_ENCRYPTION_KEY:?Generate .env.server}
+  M1917_CORS_ORIGINS: ${M1917_CORS_ORIGINS:-[]}
+  M1917_BOOTSTRAP_USERS_JSON: "[]"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: alash
+      POSTGRES_DB: alash
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Generate .env.server}
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U alash -d alash]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: [redis-server, --appendonly, "yes"]
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  migrate:
+    build: ./backend
+    environment: *api-environment
+    command: [alembic, upgrade, head]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment: *api-environment
+    command: [backend]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SERVER_DOMAIN: ${SERVER_DOMAIN:?Set a domain pointing to this server}
+    ports: ["80:80", "443:443", "443:443/udp"]
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - certificates:/data
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+  attendance-worker:
+    profiles: [attendance]
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      <<: *api-environment
+      M1917_ATTENDANCE_AUTO_ENABLED: "true"
+      M1917_ATTENDANCE_AUTO_FROM: ${M1917_ATTENDANCE_AUTO_FROM:-}
+      M1917_ATTENDANCE_GRACE_MINUTES: ${M1917_ATTENDANCE_GRACE_MINUTES:-30}
+    command: [python, -m, backend.access.worker]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  database:
+  redis:
+  certificates:
+  caddy_config:

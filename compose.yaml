@@ -39,7 +39,9 @@ services:
       M1917_JWT_SECRET: ${M1917_JWT_SECRET:-development-only-change-this-secret}
       M1917_OTP_PEPPER: ${M1917_OTP_PEPPER:-development-only-otp-pepper}
       M1917_PII_ENCRYPTION_KEY: ${M1917_PII_ENCRYPTION_KEY:-0HzTSHdTqMQboIFWW1d8PuI2OhVrPYJBZ9ZCrVnz1kk=}
-      M1917_OTP_PROVIDER: ${M1917_OTP_PROVIDER:-console}
+      M1917_LOGIN_PHONE_HOUR_LIMIT: ${M1917_LOGIN_PHONE_HOUR_LIMIT:-10}
+      M1917_LOGIN_IP_HOUR_LIMIT: ${M1917_LOGIN_IP_HOUR_LIMIT:-100}
+      M1917_CORS_ORIGINS: '${M1917_CORS_ORIGINS:-["http://localhost:8080"]}'
       M1917_BOOTSTRAP_USERS_JSON: ${M1917_BOOTSTRAP_USERS_JSON:-[]}
     depends_on:
       postgres:
@@ -55,8 +57,21 @@ services:
         condition: service_completed_successfully
 
   backend:
+    restart: unless-stopped
     build:
       context: ./backend
+    develop:
+      watch:
+        - action: rebuild
+          path: ./backend/src
+        - action: rebuild
+          path: ./backend/alembic
+        - action: rebuild
+          path: ./backend/alembic.ini
+        - action: rebuild
+          path: ./backend/pyproject.toml
+        - action: rebuild
+          path: ./backend/uv.lock
     environment: *backend-environment
     ports:
       - "8000:8000"
@@ -79,11 +94,69 @@ services:
   mobile:
     build:
       context: ./mobile
+    develop:
+      watch:
+        - action: rebuild
+          path: ./mobile/lib
+        - action: rebuild
+          path: ./mobile/assets
+        - action: rebuild
+          path: ./mobile/tool
+        - action: rebuild
+          path: ./mobile/web
+        - action: rebuild
+          path: ./mobile/pubspec.yaml
+        - action: rebuild
+          path: ./mobile/pubspec.lock
+        - action: rebuild
+          path: ./mobile/nginx.conf
     ports:
-      - "8080:80"
+      - "${M1917_MOBILE_PORT:-8080}:80"
+    # Static web hosting does not require the API to start. Keeping it independent
+    # also prevents UI-only watch rebuilds from recreating API dependencies.
+
+  push-worker:
+    build:
+      context: ./backend
+    develop:
+      watch:
+        - action: rebuild
+          path: ./backend/src
+        - action: rebuild
+          path: ./backend/pyproject.toml
+        - action: rebuild
+          path: ./backend/uv.lock
+    command: ["backend-push-worker"]
+    environment:
+      <<: *backend-environment
+      M1917_PUSH_ENABLED: ${M1917_PUSH_ENABLED:-false}
+      M1917_FIREBASE_PROJECT_ID: ${M1917_FIREBASE_PROJECT_ID:-}
+      M1917_FIREBASE_CREDENTIALS_FILE: /run/firebase/service-account.json
+      M1917_PUSH_WEB_URL: ${M1917_PUSH_WEB_URL:-}
+    volumes:
+      - type: bind
+        source: ${M1917_FIREBASE_SECRETS_DIR:-./.secrets/firebase}
+        target: /run/firebase
+        read_only: true
     depends_on:
       backend:
         condition: service_healthy
+    restart: unless-stopped
+
+  attendance-worker:
+    profiles: [attendance]
+    restart: unless-stopped
+    build:
+      context: ./backend
+    command: ["python", "-m", "backend.access.worker"]
+    environment:
+      <<: *backend-environment
+      M1917_ATTENDANCE_AUTO_ENABLED: "true"
+      M1917_ATTENDANCE_AUTO_FROM: ${M1917_ATTENDANCE_AUTO_FROM:-}
+      M1917_ATTENDANCE_GRACE_MINUTES: ${M1917_ATTENDANCE_GRACE_MINUTES:-30}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   postgres_data:

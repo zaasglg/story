@@ -1,8 +1,9 @@
+import json
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -17,6 +18,7 @@ from backend.core.time import utc_now
 from backend.identity.dependencies import CurrentUser, get_app_settings, get_db_session
 from backend.identity.models import AccountStatus, EmployeeProfile, User, UserRole
 from backend.identity.phone import normalize_phone
+from backend.identity.security import hash_password
 from backend.workforce.models import (
     Brigade,
     ChangeRequestStatus,
@@ -26,6 +28,7 @@ from backend.workforce.models import (
     WorkerAssignment,
     WorkObject,
 )
+from backend.workforce.request_pii import protect_changes, request_read, reveal_changes
 from backend.workforce.schemas import (
     AssignmentCreate,
     AssignmentRead,
@@ -35,7 +38,11 @@ from backend.workforce.schemas import (
     ChangeRequestCreate,
     ChangeRequestDecision,
     ChangeRequestRead,
+    CityCreate,
     CityRead,
+    CityUpdate,
+    SalaryAccountWrite,
+    WorkerBrigadeRead,
     WorkerCreate,
     WorkerPrivateRead,
     WorkerPublicRead,
@@ -51,8 +58,11 @@ from backend.workforce.service import (
     private_projection,
     public_projection,
     require_city,
+    require_closed_shift,
+    require_context_closed,
     require_worker,
     team_projection,
+    validate_worker_city,
 )
 
 router = APIRouter(tags=["workforce"])
@@ -89,6 +99,75 @@ async def list_cities(
     return list((await session.scalars(select(City).order_by(City.name))).all())
 
 
+@router.get("/admin/cities", response_model=list[CityRead])
+async def admin_cities(
+    session: Session,
+    _: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
+) -> list[City]:
+    return list((await session.scalars(select(City).order_by(City.name))).all())
+
+
+async def ensure_city_name(session: AsyncSession, name: str, city_id: UUID | None = None) -> None:
+    query = select(City.id).where(func.lower(City.name) == name.lower())
+    if city_id is not None:
+        query = query.where(City.id != city_id)
+    if await session.scalar(query) is not None:
+        raise ApiError(409, "city_conflict", "City name already exists")
+
+
+@router.post("/admin/cities", response_model=CityRead, status_code=201)
+async def create_city(
+    payload: CityCreate,
+    request: Request,
+    session: Session,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
+) -> City:
+    await ensure_city_name(session, payload.name)
+    item = City(**payload.model_dump(), created_at=utc_now())
+    session.add(item)
+    try:
+        await session.flush()
+        audit(
+            request,
+            session,
+            current,
+            "CITY_CREATED",
+            "city",
+            item.id,
+            new_value=payload.model_dump(),
+        )
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise ApiError(409, "city_conflict", "City name already exists") from exc
+    return item
+
+
+@router.patch("/admin/cities/{city_id}", response_model=CityRead)
+async def update_city(
+    city_id: UUID,
+    payload: CityUpdate,
+    request: Request,
+    session: Session,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
+) -> City:
+    item = await session.scalar(select(City).where(City.id == city_id).with_for_update())
+    if item is None:
+        raise ApiError(404, "city_not_found", "City was not found")
+    values = payload.model_dump(exclude_unset=True)
+    if payload.name is not None:
+        await ensure_city_name(session, payload.name, city_id)
+    for field, value in values.items():
+        setattr(item, field, value)
+    try:
+        audit(request, session, current, "CITY_UPDATED", "city", city_id, new_value=values)
+        await session.commit()
+    except IntegrityError as exc:
+        await session.rollback()
+        raise ApiError(409, "city_conflict", "City name already exists") from exc
+    return item
+
+
 @router.get("/workers/me", response_model=WorkerPrivateRead)
 async def get_own_profile(
     session: Session,
@@ -103,18 +182,51 @@ async def get_own_profile(
     )
 
 
-@router.get("/workers/public", response_model=list[WorkerPublicRead])
-async def list_public_workers(
+@router.get("/workers/me/brigade", response_model=list[WorkerBrigadeRead])
+async def get_own_brigade(
     session: Session,
-    _: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_PUBLIC_READ))],
-) -> list[WorkerPublicRead]:
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.PROFILE_READ_OWN))],
+) -> list[WorkerBrigadeRead]:
+    if current.role is not UserRole.WORKER:
+        raise ApiError(403, "worker_only", "This endpoint is available to workers only")
+    assignment = await active_assignment(session, current.id)
+    if assignment is None:
+        return []
     users = (
         await session.scalars(
             select(User)
-            .where(User.role == UserRole.WORKER, User.archived_at.is_(None))
+            .join(WorkerAssignment, WorkerAssignment.worker_user_id == User.id)
+            .where(
+                User.role == UserRole.WORKER,
+                User.archived_at.is_(None),
+                WorkerAssignment.brigade_id == assignment.brigade_id,
+                WorkerAssignment.effective_to.is_(None),
+                WorkerAssignment.archived_at.is_(None),
+            )
             .options(selectinload(User.profile))
             .order_by(User.created_at)
         )
+    ).all()
+    result = []
+    for item in users:
+        if item.profile and item.profile.archived_at is None:
+            projection = await public_projection(session, item)
+            result.append(projection.model_copy(update={"is_self": item.id == current.id}))
+    return result
+
+
+@router.get("/workers/public", response_model=list[WorkerPublicRead])
+async def list_public_workers(
+    session: Session,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_PUBLIC_READ))],
+) -> list[WorkerPublicRead]:
+    query = select(User).where(User.role == UserRole.WORKER, User.archived_at.is_(None))
+    if current.role == UserRole.MASTER:
+        query = query.join(EmployeeProfile, EmployeeProfile.user_id == User.id).where(
+            EmployeeProfile.master_user_id == current.id
+        )
+    users = (
+        await session.scalars(query.options(selectinload(User.profile)).order_by(User.created_at))
     ).all()
     return [
         await public_projection(session, item)
@@ -127,9 +239,35 @@ async def list_public_workers(
 async def get_public_worker(
     worker_id: UUID,
     session: Session,
-    _: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_PUBLIC_READ))],
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_PUBLIC_READ))],
 ) -> WorkerPublicRead:
-    return await public_projection(session, await require_worker(session, worker_id))
+    worker = await require_worker(session, worker_id)
+    if current.role == UserRole.MASTER and (
+        worker.profile is None or worker.profile.master_user_id != current.id
+    ):
+        raise ApiError(404, "worker_not_found", "Worker was not found")
+    return await public_projection(session, worker)
+
+
+@router.get("/workers/me/change-requests", response_model=list[ChangeRequestRead])
+async def own_change_requests(
+    session: Session,
+    settings: SettingsDep,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.PROFILE_READ_OWN))],
+) -> list[ChangeRequestRead]:
+    rows = list(
+        (
+            await session.scalars(
+                select(ProfileChangeRequest)
+                .where(ProfileChangeRequest.worker_user_id == current.id)
+                .order_by(ProfileChangeRequest.created_at.desc())
+                .limit(100)
+            )
+        ).all()
+    )
+
+    cipher = PiiCipher(settings.pii_encryption_key.get_secret_value())
+    return [request_read(item, cipher) for item in rows]
 
 
 @router.post("/workers/me/change-request", response_model=ChangeRequestRead, status_code=201)
@@ -137,17 +275,35 @@ async def create_change_request(
     payload: ChangeRequestCreate,
     request: Request,
     session: Session,
+    settings: SettingsDep,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.PROFILE_READ_OWN))],
-) -> ProfileChangeRequest:
+) -> ChangeRequestRead:
     if current.role is not UserRole.WORKER:
         raise ApiError(403, "worker_only", "This endpoint is available to workers only")
     changes = payload.model_dump(exclude={"reason"}, exclude_none=True, mode="json")
+    cipher = PiiCipher(settings.pii_encryption_key.get_secret_value())
+    # Repeated submits after an uncertain network outcome reuse an identical pending request.
+    await session.scalar(select(User).where(User.id == current.id).with_for_update())
+    pending = (
+        await session.scalars(
+            select(ProfileChangeRequest).where(
+                ProfileChangeRequest.worker_user_id == current.id,
+                ProfileChangeRequest.status == ChangeRequestStatus.PENDING,
+            )
+        )
+    ).all()
+    for existing in pending:
+        if (
+            reveal_changes(existing.changes, cipher) == changes
+            and existing.reason == payload.reason
+        ):
+            return request_read(existing, cipher)
     if "city_id" in changes:
         await require_city(session, UUID(str(changes["city_id"])))
     now = utc_now()
     item = ProfileChangeRequest(
         worker_user_id=current.id,
-        changes=changes,
+        changes=protect_changes(changes, cipher),
         reason=payload.reason,
         status=ChangeRequestStatus.PENDING,
         created_at=now,
@@ -166,7 +322,7 @@ async def create_change_request(
     )
     await session.commit()
     await session.refresh(item)
-    return item
+    return request_read(item, cipher)
 
 
 @router.get("/master/team", response_model=list[WorkerTeamRead])
@@ -283,6 +439,7 @@ async def create_worker(
     now = utc_now()
     worker = User(
         phone=normalize_phone(payload.phone),
+        password_hash=hash_password(payload.password) if payload.password else None,
         role=UserRole.WORKER,
         status=AccountStatus.ACTIVE,
         created_at=now,
@@ -294,6 +451,7 @@ async def create_worker(
         worker.profile = EmployeeProfile(
             user_id=worker.id,
             full_name=payload.full_name,
+            position=payload.position,
             employee_id=payload.employee_id,
             city=city.name if city else None,
             city_id=payload.city_id,
@@ -342,25 +500,31 @@ async def update_worker(
     settings: SettingsDep,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_MANAGE))],
 ) -> WorkerPrivateRead:
+    await session.scalar(select(User).where(User.id == worker_id).with_for_update())
     worker = await require_worker(session, worker_id)
     profile = worker.profile
     assert profile is not None
     values = payload.model_dump(exclude_unset=True)
-    if "city_id" in values and values["city_id"] is not None:
-        city = await require_city(session, values["city_id"])
-        profile.city = city.name
-    for field in ("full_name", "employee_id", "city_id", "photo_url", "hire_date"):
+    if "city_id" in values:
+        await validate_worker_city(session, worker_id, values["city_id"])
+        city = await require_city(session, values["city_id"]) if values["city_id"] else None
+        profile.city = city.name if city else None
+    for field in ("full_name", "position", "employee_id", "city_id", "photo_url", "hire_date"):
         if field in values:
             setattr(profile, field, values[field])
-    if "status" in values and values["status"] is not None:
+    if "status" in values and values["status"] is not None and values["status"] != worker.status:
         worker.status = values["status"]
         worker.auth_version += 1
-    if "passport_number" in values and values["passport_number"] is not None:
+    if "passport_number" in values:
         private = await session.scalar(
             select(EmployeePrivateData).where(EmployeePrivateData.user_id == worker.id)
         )
-        encrypted = PiiCipher(settings.pii_encryption_key.get_secret_value()).encrypt(
-            values["passport_number"]
+        encrypted = (
+            PiiCipher(settings.pii_encryption_key.get_secret_value()).encrypt(
+                values["passport_number"]
+            )
+            if values["passport_number"] is not None
+            else None
         )
         if private:
             private.passport_encrypted = encrypted
@@ -400,6 +564,7 @@ async def archive_worker(
     session: Session,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_MANAGE))],
 ) -> Response:
+    await require_closed_shift(session, worker_id)
     worker = await require_worker(session, worker_id)
     now = utc_now()
     worker.status = AccountStatus.ARCHIVED
@@ -423,14 +588,20 @@ async def assign_worker(
     session: Session,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_MANAGE))],
 ) -> AssignmentRead:
+    await session.scalar(select(User).where(User.id == worker_id).with_for_update())
+    await require_closed_shift(session, worker_id)
     worker = await require_worker(session, worker_id)
-    brigade = await session.get(Brigade, payload.brigade_id)
+    brigade = await session.get(Brigade, payload.brigade_id, with_for_update=True)
     if brigade is None or brigade.archived_at is not None or brigade.master_user_id is None:
         raise ApiError(422, "invalid_brigade", "An active brigade with a master is required")
     if payload.object_id:
-        obj = await session.get(WorkObject, payload.object_id)
+        obj = await session.get(WorkObject, payload.object_id, with_for_update=True)
         if obj is None or obj.archived_at is not None:
             raise ApiError(422, "invalid_object", "An active object is required")
+    if payload.object_id and obj.city_id != brigade.city_id:
+        raise ApiError(
+            422, "assignment_city_mismatch", "Object and brigade must belong to the same city"
+        )
     now = utc_now()
     previous = await active_assignment(session, worker.id)
     if previous:
@@ -470,6 +641,44 @@ async def assign_worker(
     return projected
 
 
+@router.delete("/admin/workers/{worker_id}/assignment", status_code=204)
+async def end_assignment(
+    worker_id: UUID,
+    request: Request,
+    session: Session,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_MANAGE))],
+) -> Response:
+    await require_closed_shift(session, worker_id)
+    worker = await require_worker(session, worker_id)
+    previous = await active_assignment(session, worker.id)
+    if previous is not None:
+        previous.effective_to = utc_now()
+        assert worker.profile is not None
+        worker.profile.master_user_id = None
+        audit(request, session, current, "WORKER_UNASSIGNED", "worker_assignment", previous.id)
+        await session.commit()
+    return Response(status_code=204)
+
+
+@router.get("/admin/masters", response_model=list[WorkerPublicRead])
+async def list_masters(
+    session: Session,
+    _: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_MANAGE))],
+) -> list[WorkerPublicRead]:
+    users = (
+        await session.scalars(
+            select(User)
+            .where(
+                User.role == UserRole.MASTER,
+                User.status == AccountStatus.ACTIVE,
+                User.archived_at.is_(None),
+            )
+            .options(selectinload(User.profile))
+        )
+    ).all()
+    return [await public_projection(session, user) for user in users if user.profile]
+
+
 def brigade_read(item: Brigade) -> BrigadeRead:
     return BrigadeRead(
         id=item.id,
@@ -488,6 +697,8 @@ def object_read(item: WorkObject) -> WorkObjectRead:
         city_id=item.city_id,
         city_name=item.city.name,
         address=item.address,
+        latitude=item.latitude,
+        longitude=item.longitude,
         status=item.status,
         archived_at=item.archived_at,
     )
@@ -548,9 +759,10 @@ async def archive_brigade(
     session: Session,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
 ) -> Response:
-    item = await session.get(Brigade, brigade_id)
+    item = await session.get(Brigade, brigade_id, with_for_update=True)
     if item is None or item.archived_at is not None:
         raise ApiError(404, "brigade_not_found", "Brigade was not found")
+    await require_context_closed(session, "brigade_id", item.id)
     item.archived_at = item.updated_at = utc_now()
     audit(request, session, current, "BRIGADE_ARCHIVED", "brigade", item.id)
     await session.commit()
@@ -565,12 +777,45 @@ async def update_brigade(
     session: Session,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
 ) -> BrigadeRead:
-    item = await session.get(Brigade, brigade_id)
+    item = await session.get(Brigade, brigade_id, with_for_update=True)
     if item is None or item.archived_at is not None:
         raise ApiError(404, "brigade_not_found", "Brigade was not found")
+    if "master_user_id" in payload.model_fields_set or "city_id" in payload.model_fields_set:
+        await require_context_closed(session, "brigade_id", item.id)
     values = payload.model_dump(exclude_unset=True)
     if values.get("city_id") is not None:
         await require_city(session, values["city_id"])
+        if values["city_id"] != item.city_id:
+            assigned = await session.scalar(
+                select(WorkerAssignment.id)
+                .where(
+                    WorkerAssignment.brigade_id == item.id,
+                    WorkerAssignment.effective_to.is_(None),
+                    WorkerAssignment.archived_at.is_(None),
+                )
+                .limit(1)
+            )
+            if assigned is not None:
+                raise ApiError(
+                    422,
+                    "assignment_city_mismatch",
+                    "End active assignments before changing the brigade city",
+                )
+        conflict = await session.scalar(
+            select(WorkerAssignment.id)
+            .join(WorkObject, WorkObject.id == WorkerAssignment.object_id)
+            .where(
+                WorkerAssignment.brigade_id == item.id,
+                WorkerAssignment.effective_to.is_(None),
+                WorkerAssignment.archived_at.is_(None),
+                WorkObject.city_id != values["city_id"],
+            )
+            .limit(1)
+        )
+        if conflict is not None:
+            raise ApiError(
+                422, "assignment_city_mismatch", "City conflicts with an active assignment"
+            )
     if values.get("master_user_id") is not None:
         master = await session.get(User, values["master_user_id"])
         if (
@@ -649,9 +894,10 @@ async def archive_object(
     session: Session,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
 ) -> Response:
-    item = await session.get(WorkObject, object_id)
+    item = await session.get(WorkObject, object_id, with_for_update=True)
     if item is None or item.archived_at is not None:
         raise ApiError(404, "object_not_found", "Object was not found")
+    await require_context_closed(session, "object_id", item.id)
     item.archived_at = item.updated_at = utc_now()
     audit(request, session, current, "OBJECT_ARCHIVED", "work_object", item.id)
     await session.commit()
@@ -666,12 +912,29 @@ async def update_object(
     session: Session,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
 ) -> WorkObjectRead:
-    item = await session.get(WorkObject, object_id)
+    item = await session.get(WorkObject, object_id, with_for_update=True)
     if item is None or item.archived_at is not None:
         raise ApiError(404, "object_not_found", "Object was not found")
     values = payload.model_dump(exclude_unset=True)
+    if "address" in values and values["address"] != item.address and "latitude" not in values:
+        values.update(latitude=None, longitude=None)
     if values.get("city_id") is not None:
         await require_city(session, values["city_id"])
+        conflict = await session.scalar(
+            select(WorkerAssignment.id)
+            .join(Brigade, Brigade.id == WorkerAssignment.brigade_id)
+            .where(
+                WorkerAssignment.object_id == item.id,
+                WorkerAssignment.effective_to.is_(None),
+                WorkerAssignment.archived_at.is_(None),
+                Brigade.city_id != values["city_id"],
+            )
+            .limit(1)
+        )
+        if conflict is not None:
+            raise ApiError(
+                422, "assignment_city_mismatch", "City conflicts with an active assignment"
+            )
     for field, value in values.items():
         setattr(item, field, value)
     item.updated_at = utc_now()
@@ -698,15 +961,19 @@ async def update_object(
 @router.get("/admin/change-requests", response_model=list[ChangeRequestRead])
 async def list_change_requests(
     session: Session,
+    settings: SettingsDep,
     _: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_MANAGE))],
-) -> list[ProfileChangeRequest]:
-    return list(
+) -> list[ChangeRequestRead]:
+    rows = list(
         (
             await session.scalars(
                 select(ProfileChangeRequest).order_by(ProfileChangeRequest.created_at.desc())
             )
         ).all()
     )
+
+    cipher = PiiCipher(settings.pii_encryption_key.get_secret_value())
+    return [request_read(item, cipher) for item in rows]
 
 
 @router.post("/admin/change-requests/{request_id}/decision", response_model=ChangeRequestRead)
@@ -717,7 +984,7 @@ async def decide_change_request(
     session: Session,
     settings: SettingsDep,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_MANAGE))],
-) -> ProfileChangeRequest:
+) -> ChangeRequestRead:
     item = await session.get(ProfileChangeRequest, request_id)
     if item is None:
         raise ApiError(404, "change_request_not_found", "Change request was not found")
@@ -725,12 +992,16 @@ async def decide_change_request(
         raise ApiError(409, "change_request_decided", "Change request was already decided")
     now = utc_now()
     if payload.approve:
+        await session.scalar(select(User).where(User.id == item.worker_user_id).with_for_update())
         worker = await require_worker(session, item.worker_user_id)
         profile = worker.profile
         assert profile is not None
-        changes = dict(item.changes)
+        changes = reveal_changes(
+            item.changes, PiiCipher(settings.pii_encryption_key.get_secret_value())
+        )
         if "city_id" in changes:
             city_id = UUID(str(changes.pop("city_id")))
+            await validate_worker_city(session, worker.id, city_id)
             city = await require_city(session, city_id)
             profile.city_id, profile.city = city_id, city.name
         if "passport_number" in changes:
@@ -755,6 +1026,7 @@ async def decide_change_request(
     else:
         item.status = ChangeRequestStatus.REJECTED
     item.reviewed_by, item.reviewed_at, item.updated_at = current.id, now, now
+    item.review_note = payload.review_note
     audit(
         request,
         session,
@@ -766,4 +1038,81 @@ async def decide_change_request(
     )
     await session.commit()
     await session.refresh(item)
-    return item
+    return request_read(item, PiiCipher(settings.pii_encryption_key.get_secret_value()))
+
+
+@router.get("/admin/workers/{worker_id}/salary-account", response_model=SalaryAccountWrite | None)
+async def read_salary_account(
+    worker_id: UUID,
+    session: Session,
+    settings: SettingsDep,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_BANK_READ_ALL))],
+    request: Request,
+) -> SalaryAccountWrite | None:
+    await require_worker(session, worker_id)
+    private = await session.scalar(
+        select(EmployeePrivateData).where(EmployeePrivateData.user_id == worker_id)
+    )
+    result = None
+    if private and private.salary_account_encrypted:
+        result = SalaryAccountWrite.model_validate_json(
+            PiiCipher(settings.pii_encryption_key.get_secret_value()).decrypt(
+                private.salary_account_encrypted
+            )
+        )
+    audit(request, session, current, "SALARY_ACCOUNT_READ", "worker", worker_id)
+    await session.commit()
+    return result
+
+
+@router.get("/workers/me/salary-account", response_model=SalaryAccountWrite | None)
+async def read_own_salary_account(
+    session: Session,
+    settings: SettingsDep,
+    request: Request,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_BANK_READ_OWN))],
+) -> SalaryAccountWrite | None:
+    return await read_salary_account(current.id, session, settings, current, request)
+
+
+@router.put("/admin/workers/{worker_id}/salary-account", response_model=SalaryAccountWrite)
+async def write_salary_account(
+    worker_id: UUID,
+    payload: SalaryAccountWrite,
+    session: Session,
+    settings: SettingsDep,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.COMPANY_BANK_MANAGE))],
+    request: Request,
+) -> SalaryAccountWrite:
+    await require_worker(session, worker_id)
+    private = await session.scalar(
+        select(EmployeePrivateData).where(EmployeePrivateData.user_id == worker_id)
+    )
+    if private is None:
+        private = EmployeePrivateData(user_id=worker_id, updated_at=utc_now())
+        session.add(private)
+    private.salary_account_encrypted = PiiCipher(
+        settings.pii_encryption_key.get_secret_value()
+    ).encrypt(json.dumps(payload.model_dump(), ensure_ascii=False))
+    private.updated_at = utc_now()
+    audit(request, session, current, "SALARY_ACCOUNT_UPDATED", "worker", worker_id)
+    await session.commit()
+    return payload
+
+
+@router.delete("/admin/workers/{worker_id}/salary-account", status_code=204)
+async def delete_salary_account(
+    worker_id: UUID,
+    session: Session,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.COMPANY_BANK_MANAGE))],
+    request: Request,
+) -> None:
+    await require_worker(session, worker_id)
+    private = await session.scalar(
+        select(EmployeePrivateData).where(EmployeePrivateData.user_id == worker_id)
+    )
+    if private:
+        private.salary_account_encrypted = None
+        private.updated_at = utc_now()
+    audit(request, session, current, "SALARY_ACCOUNT_DELETED", "worker", worker_id)
+    await session.commit()
