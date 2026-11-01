@@ -1,0 +1,5 @@
+# Invest already runs Nginx on80/443. Start only backend and its dependencies.
+services:
+  backend:
+    ports:
+      - "127.0.0.1:8017:8000"

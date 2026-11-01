@@ -87,3 +87,21 @@ docker compose --env-file .env.server -f compose.server.yaml logs -f attendance-
 Не переносит данные прежней БД, не исправляет исторические финансы и не настраивает Firebase/APNs. Автоматические off-host backups ещё нужно организовать; Docker volume резервной копией не является. Аудиопроверка использует ffprobe, установленный в Backend Docker image.
 
 Обновление существующей БД выполняется отдельно после проверенной резервной копии и разрешения. Не используйте `down -v`: команда удаляет данные volumes.
+
+## Invest с существующим Nginx
+
+Для установки за существующим Nginx используйте overlay с внутренним портом8017. Генератор можно запустить без `--domain`: это создаёт только private/SSH конфигурацию, не публичный HTTPS endpoint.
+
+```sh
+python3 deploy/generate_server_env.py
+docker compose --env-file .env.server -f compose.server.yaml -f compose.invest.yaml up -d --build backend
+curl --fail http://127.0.0.1:8017/health/ready
+```
+
+Caddy здесь не запускается. После выбора домена настройте отдельный Nginx virtual host на127.0.0.1:8017 с WebSocket upgrade и HTTPS. Не заменяйте конфигурации других сайтов. Для временного защищённого подключения симулятора с Mac:
+
+```sh
+ssh -N -L 8000:127.0.0.1:8017 Invest
+```
+
+После этого `http://localhost:8000/api/v1` на Mac ведёт через SSH к Invest. Это не заменяет публичный домен и HTTPS для внешних устройств.
