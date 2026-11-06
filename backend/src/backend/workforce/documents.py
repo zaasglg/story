@@ -1,5 +1,6 @@
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Annotated, Literal
+from urllib.parse import quote
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Query, Response, UploadFile
@@ -11,9 +12,9 @@ from backend.authorization.permissions import Permission
 from backend.core.errors import ApiError
 from backend.core.time import ensure_utc, utc_now
 from backend.identity.dependencies import CurrentUser
+from backend.identity.models import EmployeeProfile, User
 from backend.workforce.models import EmployeeDocument
 from backend.workforce.routes import Session
-from backend.workforce.service import require_worker
 
 router = APIRouter(tags=["documents"])
 Admin = Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_MANAGE))]
@@ -83,21 +84,21 @@ async def load(session: Session, document_id: UUID) -> EmployeeDocument:
 
 
 def file_response(item: EmployeeDocument) -> Response:
-    safe_name = item.filename.replace('"', "").replace("\r", "").replace("\n", "")
+    safe_name = quote(item.filename, safe="")
     return Response(
         item.content,
         media_type=item.content_type,
         headers={
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Content-Disposition": f"attachment; filename*=UTF-8''{safe_name}",
             "Cache-Control": "private, no-store",
             "X-Content-Type-Options": "nosniff",
         },
     )
 
 
+@router.get("/me/documents", response_model=list[DocumentRead])
 @router.get("/workers/me/documents", response_model=list[DocumentRead])
 async def own_documents(session: Session, actor: Own) -> list[DocumentRead]:
-    await require_worker(session, actor.id)
     rows = (
         await session.scalars(
             select(EmployeeDocument)
@@ -111,6 +112,7 @@ async def own_documents(session: Session, actor: Own) -> list[DocumentRead]:
     return [read(item) for item in rows]
 
 
+@router.get("/me/documents/{document_id}/file")
 @router.get("/workers/me/documents/{document_id}/file")
 async def own_document_file(document_id: UUID, session: Session, actor: Own) -> Response:
     item = await load(session, document_id)
@@ -141,7 +143,11 @@ async def create_document(
     issue_date: Annotated[date | None, Form()] = None,
     expires_at: Annotated[date | None, Form()] = None,
 ) -> DocumentRead:
-    await require_worker(session, worker_user_id)
+    owner = await session.get(User, worker_user_id)
+    if owner is None or owner.archived_at is not None:
+        raise ApiError(404, "user_not_found", "Employee was not found")
+    if not title.strip():
+        raise ApiError(422, "invalid_document_title", "Enter a document title")
     content_type = file.content_type or ""
     try:
         content = await file.read(MAX_DOCUMENT_BYTES + 1)
@@ -188,3 +194,39 @@ async def archive_document(document_id: UUID, session: Session, _: Admin) -> Res
 @router.get("/admin/documents/{document_id}/file")
 async def admin_document_file(document_id: UUID, session: Session, _: Admin) -> Response:
     return file_response(await load(session, document_id))
+
+
+@router.get("/admin/document-owners")
+async def document_owners(session: Session, _: Admin) -> list[dict]:
+    rows = (
+        await session.execute(
+            select(User.id, User.role, EmployeeProfile.full_name)
+            .join(EmployeeProfile, EmployeeProfile.user_id == User.id)
+            .where(User.archived_at.is_(None), EmployeeProfile.archived_at.is_(None))
+            .order_by(EmployeeProfile.full_name)
+        )
+    ).all()
+    return [{"id": row.id, "role": row.role, "full_name": row.full_name} for row in rows]
+
+
+@router.post("/me/documents", response_model=DocumentRead, status_code=201)
+async def upload_own_document(
+    session: Session,
+    actor: Own,
+    document_type: Annotated[DocumentType, Form()],
+    title: Annotated[str, Form(min_length=1, max_length=255)],
+    file: Annotated[UploadFile, File()],
+    issue_date: Annotated[date | None, Form()] = None,
+    expires_at: Annotated[date | None, Form()] = None,
+) -> DocumentRead:
+    return await create_document(
+        session, actor, actor.id, document_type, title, file, issue_date, expires_at
+    )
+
+
+@router.delete("/me/documents/{document_id}", status_code=204)
+async def archive_own_document(document_id: UUID, session: Session, actor: Own) -> Response:
+    item = await load(session, document_id)
+    if item.worker_user_id != actor.id:
+        raise ApiError(404, "document_not_found", "Document was not found")
+    return await archive_document(document_id, session, actor)

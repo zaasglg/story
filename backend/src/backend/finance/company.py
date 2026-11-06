@@ -4,7 +4,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -394,16 +394,7 @@ async def object_finance_operations(
 class BankWrite(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=255)
-    iban: str = Field(min_length=15, max_length=34, pattern=r"^[A-Z]{2}[0-9]{2}[A-Z0-9]+$")
-
-    @field_validator("iban")
-    @classmethod
-    def validate_checksum(cls, value: str) -> str:
-        rearranged = value[4:] + value[:4]
-        numeric = "".join(str(ord(char) - 55) if char.isalpha() else char for char in rearranged)
-        if int(numeric) % 97 != 1:
-            raise ValueError("Invalid IBAN checksum")
-        return value
+    iban: str = Field(min_length=1, max_length=80)
 
 
 class BankRead(BaseModel):

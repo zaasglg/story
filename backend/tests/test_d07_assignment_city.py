@@ -18,7 +18,9 @@ async def test_mismatched_assignment_and_city_edits_are_rejected_atomically(cont
     obj = (
         await context.client.post(
             "/api/v1/admin/objects",
-            headers=headers,
+            headers={
+                "Authorization": f"Bearer {(await login(context, UserRole.BOSS))['access_token']}"
+            },
             json={"name": "Synthetic other object", "city_id": city["id"], "address": "Synthetic"},
         )
     ).json()
@@ -30,7 +32,9 @@ async def test_mismatched_assignment_and_city_edits_are_rejected_atomically(cont
     assert result.status_code == 422
     for path in [f"/admin/brigades/{bid}", f"/admin/objects/{oid}", f"/admin/workers/{wid}"]:
         result = await context.client.patch(
-            "/api/v1" + path, headers=headers, json={"city_id": city["id"]}
+            "/api/v1" + path,
+            headers=auth(await login(context, UserRole.BOSS)) if "/objects/" in path else headers,
+            json={"city_id": city["id"]},
         )
         assert result.status_code == 422, result.text
     workers = (await context.client.get("/api/v1/admin/workers", headers=headers)).json()
@@ -113,3 +117,43 @@ async def test_postgres_profile_city_edit_cannot_race_with_assignment(context, m
                 if not task.done():
                     task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_unchanged_object_city_does_not_block_address_edit_with_legacy_assignment(context):
+    from uuid import UUID
+
+    from backend.workforce.models import Brigade
+
+    admin = await login(context, UserRole.ADMIN)
+    _, _, brigade_id, object_id = await prepare_assignment(context, admin)
+    boss = auth(await login(context, UserRole.BOSS))
+    original = next(
+        row
+        for row in (await context.client.get("/api/v1/boss/objects", headers=boss)).json()
+        if row["id"] == object_id
+    )
+    other = (
+        await context.client.post(
+            "/api/v1/admin/cities",
+            headers=auth(admin),
+            json={"name": "Legacy other city", "timezone": "Asia/Almaty"},
+        )
+    ).json()
+    async with context.database.session_factory() as session:
+        brigade = await session.get(Brigade, UUID(brigade_id))
+        brigade.city_id = UUID(other["id"])
+        await session.commit()
+    updated = await context.client.patch(
+        f"/api/v1/boss/objects/{object_id}",
+        headers=boss,
+        json={
+            "city_id": original["city_id"],
+            "address": "Updated exact address",
+            "latitude": 51.67,
+            "longitude": 39.18,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["city_id"] == original["city_id"]
+    assert updated.json()["address"] == "Updated exact address"
+    assert updated.json()["latitude"] == 51.67

@@ -14,7 +14,7 @@ from backend.core.errors import ApiError
 from backend.core.time import utc_now
 from backend.identity.dependencies import CurrentUser
 from backend.identity.models import EmployeeProfile, UserRole
-from backend.workforce.models import EmployeePhoto
+from backend.workforce.models import EmployeePhoto, WorkObject, WorkObjectPhoto
 from backend.workforce.routes import Session
 
 router = APIRouter(tags=["workforce"])
@@ -63,6 +63,57 @@ async def upload_worker_photo(
     session.add(photo)
     await session.commit()
     return {"photo_url": f"/photos/{photo.id}"}
+
+
+@router.post("/boss/objects/{object_id}/photo", status_code=201)
+@router.post("/admin/objects/{object_id}/photo", status_code=201)
+async def upload_object_photo(
+    object_id: UUID,
+    file: UploadFile,
+    session: Session,
+    _: Annotated[CurrentUser, Depends(require_permission(Permission.OBJECT_MANAGE))],
+) -> dict[str, str]:
+    item = await session.get(WorkObject, object_id, with_for_update=True)
+    if item is None or item.archived_at is not None:
+        raise ApiError(404, "object_not_found", "Object was not found")
+    try:
+        content = await file.read(MAX_PHOTO_BYTES + 1)
+    finally:
+        await file.close()
+    if len(content) > MAX_PHOTO_BYTES:
+        raise ApiError(413, "photo_too_large", "Photo must not exceed 5 MB")
+    normalized = await run_in_threadpool(normalize_photo, content)
+    photo = await session.get(WorkObjectPhoto, object_id, with_for_update=True)
+    if photo is None:
+        session.add(WorkObjectPhoto(object_id=object_id, content=normalized, created_at=utc_now()))
+    else:
+        photo.content = normalized
+        photo.created_at = utc_now()
+    item.photo_url = f"/object-photos/{object_id}"
+    item.photo_is_demo = False
+    item.updated_at = utc_now()
+    await session.commit()
+    return {"photo_url": item.photo_url}
+
+
+@router.delete("/boss/objects/{object_id}/photo", status_code=204)
+@router.delete("/admin/objects/{object_id}/photo", status_code=204)
+async def delete_object_photo(
+    object_id: UUID,
+    session: Session,
+    _: Annotated[CurrentUser, Depends(require_permission(Permission.OBJECT_MANAGE))],
+) -> Response:
+    item = await session.get(WorkObject, object_id, with_for_update=True)
+    if item is None or item.archived_at is not None:
+        raise ApiError(404, "object_not_found", "Object was not found")
+    photo = await session.get(WorkObjectPhoto, object_id, with_for_update=True)
+    if photo is not None:
+        await session.delete(photo)
+    item.photo_url = None
+    item.photo_is_demo = False
+    item.updated_at = utc_now()
+    await session.commit()
+    return Response(status_code=204)
 
 
 @router.get("/photos/{photo_id}")

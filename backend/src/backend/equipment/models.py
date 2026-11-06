@@ -1,7 +1,17 @@
 from datetime import date, datetime
+from decimal import Decimal
 from uuid import UUID, uuid4
 
-from sqlalchemy import CheckConstraint, Date, DateTime, ForeignKey, Integer, LargeBinary, String
+from sqlalchemy import (
+    CheckConstraint,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    Numeric,
+    String,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.identity.models import Base
@@ -15,6 +25,8 @@ class EquipmentItem(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     photo_url: Mapped[str | None] = mapped_column(String(128))
     serial_number: Mapped[str | None] = mapped_column(String(128), unique=True)
+    price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
+    currency: Mapped[str] = mapped_column(String(3), default="RUB", server_default="RUB")
     available_quantity: Mapped[int] = mapped_column(Integer, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

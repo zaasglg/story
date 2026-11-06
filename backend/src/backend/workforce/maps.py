@@ -18,7 +18,7 @@ from backend.core.errors import ApiError
 from backend.identity.dependencies import CurrentUser
 
 router = APIRouter(prefix="/admin/maps", tags=["maps"])
-Actor = Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))]
+Actor = Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_READ))]
 
 
 class AddressGeocoder:
@@ -28,17 +28,19 @@ class AddressGeocoder:
         self.client = httpx.AsyncClient(
             base_url=settings.geocoding_url.rstrip("/"),
             timeout=10,
-            headers={"User-Agent": "ALASH-M1917/1.0 (kz.alash.m1917)",
-                     "Accept-Language": "ru"},
+            headers={"User-Agent": "ALASH-M1917/1.0 (kz.alash.m1917)", "Accept-Language": "ru"},
         )
         self.cache: OrderedDict[str, tuple[float, list[dict]]] = OrderedDict()
         self.last_request = 0.0
         self.lock = asyncio.Lock()
 
     async def lookup(self, path: str, params: dict) -> list[dict]:
-        key = "maps:cache:" + hashlib.sha256(
-            json.dumps([self.settings.geocoding_url, path, params], sort_keys=True).encode()
-        ).hexdigest()
+        key = (
+            "maps:cache:"
+            + hashlib.sha256(
+                json.dumps([self.settings.geocoding_url, path, params], sort_keys=True).encode()
+            ).hexdigest()
+        )
         try:
             if self.redis is not None:
                 cached = await self.redis.get(key)
@@ -64,14 +66,25 @@ class AddressGeocoder:
                     lon, lat = feature["geometry"]["coordinates"][:2]
                     if not (-90 <= float(lat) <= 90 and -180 <= float(lon) <= 180):
                         continue
-                    street = " ".join(str(props[k]) for k in ("street", "housenumber")
-                                      if props.get(k))
-                    parts = [props.get("city") or props.get("town") or props.get("village"),
-                             street, props.get("name"), props.get("state"), props.get("country")]
+                    street = " ".join(
+                        str(props[k]) for k in ("street", "housenumber") if props.get(k)
+                    )
+                    parts = [
+                        props.get("city") or props.get("town") or props.get("village"),
+                        street,
+                        props.get("name"),
+                        props.get("state"),
+                        props.get("country"),
+                    ]
                     address = ", ".join(dict.fromkeys(str(part) for part in parts if part))
                     if address:
-                        places.append({"address": address[:2000],
-                                       "latitude": float(lat), "longitude": float(lon)})
+                        places.append(
+                            {
+                                "address": address[:2000],
+                                "latitude": float(lat),
+                                "longitude": float(lon),
+                            }
+                        )
                 if self.redis is not None:
                     await self.redis.set(key, json.dumps(places), ex=86400)
                 else:
@@ -92,8 +105,11 @@ def geocoder(request: Request) -> AddressGeocoder:
 @router.get("/config")
 async def map_config(request: Request, _: Actor) -> dict:
     settings = request.app.state.settings
-    return {"tile_url": settings.map_tile_url, "attribution": settings.map_attribution,
-            "attribution_url": settings.map_attribution_url}
+    return {
+        "tile_url": settings.map_tile_url,
+        "attribution": settings.map_attribution,
+        "attribution_url": settings.map_attribution_url,
+    }
 
 
 @router.get("/search")

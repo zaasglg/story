@@ -135,6 +135,7 @@ class FinancialRequest(Base):
     currency: Mapped[str] = mapped_column(String(3), nullable=False)
     period: Mapped[date] = mapped_column(Date, nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
+    evidence_url: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="PENDING_BOSS")
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
     created_by: Mapped[UUID] = mapped_column(ForeignKey("users.id", ondelete="RESTRICT"))

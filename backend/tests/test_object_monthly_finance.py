@@ -24,7 +24,9 @@ async def prepare_reports(context):
     for number, city_id in ((1, city), (2, city), (3, other_city.json()["id"])):
         response = await context.client.post(
             "/api/v1/admin/objects",
-            headers=headers[UserRole.ADMIN],
+            headers={
+                "Authorization": f"Bearer {(await login(context, UserRole.BOSS))['access_token']}"
+            },
             json={"name": f"Нысан №{number}", "city_id": city_id, "address": "Строителей, 10"},
         )
         assert response.status_code == 201

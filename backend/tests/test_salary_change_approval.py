@@ -47,6 +47,24 @@ async def setup_salary(context):
         return headers, str(entry.id)
 
 
+async def test_salary_filter_is_applied_before_pagination(context):
+    headers, entry = await setup_salary(context)
+    response = await context.client.get(
+        "/api/v1/admin/salary-ledger", headers=headers[UserRole.ADMIN]
+    )
+    worker = response.json()[0]["worker_user_id"]
+    scoped = await context.client.get(
+        f"/api/v1/admin/salary-ledger?worker_user_id={worker}&limit=1",
+        headers=headers[UserRole.ADMIN],
+    )
+    assert [row["id"] for row in scoped.json()] == [entry]
+    empty = await context.client.get(
+        "/api/v1/admin/salary-ledger?worker_user_id=00000000-0000-0000-0000-000000000000",
+        headers=headers[UserRole.ADMIN],
+    )
+    assert empty.json() == []
+
+
 def proposal(amount="150000.00", revision=0, current="120000.00"):
     return {
         "expected_amount": current,

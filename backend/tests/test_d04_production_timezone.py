@@ -8,6 +8,7 @@ from sqlalchemy import select
 from test_operations_api import auth, prepare_assignment
 
 from backend.identity.models import EmployeeProfile, UserRole
+from backend.operations.models import ProductionEntry
 from backend.workforce.models import City, WorkObject
 
 
@@ -35,7 +36,18 @@ async def test_local_midnight_month_year_and_object_timezone(context, monkeypatc
     response = await context.client.post(
         "/api/v1/workers/me/production", headers=auth(worker), json={"volume_m3": "7"}
     )
-    assert response.status_code == 201
+    assert response.status_code == 403
+    async with context.database.session_factory() as session:
+        session.add(
+            ProductionEntry(
+                worker_user_id=UUID(wid),
+                object_id=UUID(oid),
+                timezone="Europe/Moscow",
+                volume_m3=Decimal("7"),
+                recorded_at=clock,
+            )
+        )
+        await session.commit()
     journal = (
         await context.client.get("/api/v1/workers/me/production", headers=auth(worker))
     ).json()

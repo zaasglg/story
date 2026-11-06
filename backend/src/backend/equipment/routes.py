@@ -1,5 +1,6 @@
 from datetime import date
-from typing import Annotated
+from decimal import Decimal
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -29,12 +30,16 @@ class ItemCreate(BaseModel):
     serial_number: str | None = Field(default=None, min_length=1, max_length=128)
     quantity: int = Field(ge=0, le=1000000)
     photo_url: str | None = Field(default=None, max_length=128)
+    price: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+    currency: Literal["RUB", "KZT", "USD", "EUR"] = "RUB"
 
 
 class ItemUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(min_length=1, max_length=255)
     photo_url: str | None = Field(default=None, max_length=128)
+    price: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+    currency: Literal["RUB", "KZT", "USD", "EUR"] = "RUB"
 
 
 class ItemRead(BaseModel):
@@ -44,6 +49,8 @@ class ItemRead(BaseModel):
     serial_number: str | None
     available_quantity: int
     photo_url: str | None
+    price: Decimal | None
+    currency: str
 
 
 class StockAdjustment(BaseModel):
@@ -171,6 +178,8 @@ async def create_item(
         name=payload.name,
         photo_url=payload.photo_url,
         serial_number=payload.serial_number,
+        price=payload.price,
+        currency=payload.currency,
         available_quantity=payload.quantity,
         created_at=now,
         updated_at=now,
@@ -214,6 +223,10 @@ async def update_item(
         await validate_photo(session, payload.photo_url)
         item.photo_url = payload.photo_url
     item.name, item.updated_at = payload.name, utc_now()
+    if "price" in payload.model_fields_set:
+        item.price = payload.price
+    if "currency" in payload.model_fields_set:
+        item.currency = payload.currency
     event(session, request, actor, "EQUIPMENT_UPDATED", item.id)
     await session.commit()
     return item

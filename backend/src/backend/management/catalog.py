@@ -122,7 +122,9 @@ RESOURCES = {
 class BrowseQuery(BaseModel):
     q: str = Field(default="", max_length=160)
     status: str | None = Field(default=None, max_length=32)
+    type: Literal["BONUS", "PENALTY", "ADVANCE", "PAYMENT", "SALARY", "SALARY_CHANGE"] | None = None
     city_id: UUID | None = None
+    category: str | None = Field(default=None, max_length=32)
     date_from: date | None = None
     date_to: date | None = None
     sort: Literal["date", "name", "amount", "status"] = "date"
@@ -162,6 +164,10 @@ def base_query(name: str, resource: Resource):
             )
     if model in (Brigade, WorkObject):
         query = query.options(selectinload(model.city))
+    if model is WorkObject:
+        query = query.options(
+            selectinload(WorkObject.responsible_master).selectinload(User.profile)
+        )
     if model is WorkDay:
         query = work_day_query()
     if model is WorkSchedule:
@@ -212,6 +218,14 @@ def columns(resource: Resource):
 
 def filtered(query, resource: Resource, params: BrowseQuery):
     model = resource.model
+    if params.category:
+        if model is not Expense:
+            raise ApiError(422, "invalid_filter", "Category filter is not supported")
+        query = query.where(Expense.category == params.category)
+    if params.type:
+        if model is not FinancialRequest:
+            raise ApiError(422, "invalid_filter", "Type filter is not supported")
+        query = query.where(FinancialRequest.type == params.type)
     worker, city, sorts = columns(resource)
     if params.date_from and params.date_to and params.date_from > params.date_to:
         raise ApiError(422, "invalid_date_range", "Date range is invalid")
@@ -328,7 +342,19 @@ async def projection(session: AsyncSession, resource: Resource, item, request: R
         )
     else:
         result = resource.reader.model_validate(item, from_attributes=True)
-    return result.model_dump(mode="json")
+    data = result.model_dump(mode="json")
+    if model is WorkAuthorization:
+        employee = (
+            await session.execute(
+                select(EmployeeProfile.photo_url, User.role)
+                .join(User, User.id == EmployeeProfile.user_id)
+                .where(User.id == item.worker_user_id)
+            )
+        ).first()
+        if employee:
+            data["worker_photo_url"] = employee.photo_url
+            data["worker_role"] = employee.role.value
+    return data
 
 
 async def labels_for(session: AsyncSession, items: list[dict]) -> dict[str, str]:

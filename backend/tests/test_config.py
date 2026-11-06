@@ -7,14 +7,11 @@ from backend.core.config import Settings
 def test_database_url_converts_render_postgres_url_for_asyncpg() -> None:
     settings = Settings(
         database_url=(
-            "postgres://user:pass@host.example/db"
-            "?sslmode=require&channel_binding=require"
+            "postgres://user:pass@host.example/db?sslmode=require&channel_binding=require"
         )
     )
 
-    assert settings.database_url == (
-        "postgresql+asyncpg://user:pass@host.example/db?ssl=require"
-    )
+    assert settings.database_url == ("postgresql+asyncpg://user:pass@host.example/db?ssl=require")
 
 
 def test_database_url_preserves_non_postgres_urls() -> None:

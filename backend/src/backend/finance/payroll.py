@@ -18,6 +18,7 @@ from backend.core.errors import ApiError
 from backend.core.time import utc_now
 from backend.finance.models import FinancialRequest, LedgerCorrection, LedgerEntry
 from backend.finance.payroll_costs import sync_payroll_cost
+from backend.finance.receipts import FinanceReceipt
 from backend.identity.dependencies import CurrentUser, get_db_session
 from backend.identity.models import AccountStatus, EmployeeProfile, User, UserRole
 from backend.operations.models import WorkDay, WorkDayStatus
@@ -101,11 +102,15 @@ class RequestCreate(BaseModel):
     currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
     period: date
     reason: str = Field(min_length=1, max_length=2000)
+    evidence_url: str | None = Field(
+        default=None,
+        pattern=r"^/finance/evidence/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/file$",
+        max_length=255,
+    )
 
     @model_validator(mode="after")
     def month_start(self):
-        if self.period.day != 1:
-            raise ValueError("Period must be the first day of the payroll month")
+        self.period = self.period.replace(day=1)
         return self
 
 
@@ -140,6 +145,10 @@ async def create_request(
             raise ApiError(409, "idempotency_conflict", "Key was already used for another request")
         return existing
     await require_worker(session, payload.worker_user_id)
+    if payload.evidence_url:
+        evidence = await session.get(FinanceReceipt, UUID(payload.evidence_url.split("/")[-2]))
+        if evidence is None or evidence.created_by != actor.id:
+            raise ApiError(422, "invalid_evidence", "Upload evidence from this account")
     if payload.type == "SALARY":
         expected = await calculated_salary(
             session, payload.worker_user_id, payload.period, payload.currency
@@ -440,8 +449,7 @@ async def salary_calculation(
     _: Creator,
     currency: Annotated[str, Query(pattern=r"^[A-Z]{3}$")] = "RUB",
 ) -> SalaryCalculation:
-    if period.day != 1:
-        raise ApiError(422, "invalid_period", "Period must start on the first day of the month")
+    period = period.replace(day=1)
     await require_worker(session, worker_user_id)
     return SalaryCalculation(
         worker_user_id=worker_user_id,
@@ -739,6 +747,7 @@ async def admin_salary_ledger(
     limit: Annotated[int, Query(ge=1, le=100)] = 25,
     offset: Annotated[int, Query(ge=0)] = 0,
     q: Annotated[str, Query(max_length=200)] = "",
+    worker_user_id: UUID | None = None,
 ) -> list[AdminSalaryRead]:
     rows = (
         await session.execute(
@@ -746,6 +755,7 @@ async def admin_salary_ledger(
             .join(EmployeeProfile, EmployeeProfile.user_id == LedgerEntry.worker_user_id)
             .where(
                 LedgerEntry.type == "SALARY",
+                *([LedgerEntry.worker_user_id == worker_user_id] if worker_user_id else []),
                 EmployeeProfile.full_name.icontains(q.strip(), autoescape=True),
             )
             .order_by(LedgerEntry.period.desc(), LedgerEntry.id)

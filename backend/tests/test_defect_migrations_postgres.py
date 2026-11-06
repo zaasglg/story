@@ -160,7 +160,7 @@ async def test_defect_migrations_preserve_history_and_financial_values():
         # altering original monetary values or inventing historical rating snapshots.
         await migrate("head")
         assert (
-            await connection.fetchval("SELECT version_num FROM alembic_version") == "20261101_0037"
+            await connection.fetchval("SELECT version_num FROM alembic_version") == "20261106_0049"
         )
         assert (
             await connection.fetch("SELECT id,amount,currency,status FROM expenses")

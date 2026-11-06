@@ -1,23 +1,27 @@
-from datetime import datetime
+from datetime import date, datetime
+from decimal import Decimal
 from enum import StrEnum
 from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
+    Date,
     DateTime,
     Enum,
     Float,
     ForeignKey,
     Index,
     LargeBinary,
+    Numeric,
     String,
     Text,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from backend.identity.models import Base
+from backend.identity.models import Base, User
 
 
 class EmployeePhoto(Base):
@@ -88,12 +92,51 @@ class Brigade(Base):
     city: Mapped[City] = relationship()
 
 
+class WorkObjectPhoto(Base):
+    __tablename__ = "work_object_photos"
+    object_id: Mapped[UUID] = mapped_column(
+        ForeignKey("work_objects.id", ondelete="CASCADE"), primary_key=True
+    )
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class WorkObject(Base):
     __tablename__ = "work_objects"
+    __table_args__ = (
+        CheckConstraint(
+            "planned_hours IS NULL OR planned_hours > 0", name="ck_object_planned_hours"
+        ),
+        CheckConstraint(
+            "planned_volume_m3 IS NULL OR planned_volume_m3 > 0", name="ck_object_planned_volume"
+        ),
+        CheckConstraint(
+            "(progress_unit IS NULL AND planned_quantity IS NULL) OR "
+            "(progress_unit IS NOT NULL AND planned_quantity IS NOT NULL AND "
+            "progress_unit IN ('hours', 'm3') AND planned_quantity > 0)",
+            name="ck_work_objects_progress_plan",
+        ),
+    )
+    planned_hours: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    planned_volume_m3: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
+    progress_unit: Mapped[str | None] = mapped_column(String(8))
+    planned_quantity: Mapped[Decimal | None] = mapped_column(Numeric(14, 2))
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     city_id: Mapped[UUID] = mapped_column(ForeignKey("cities.id", ondelete="RESTRICT"), index=True)
+    start_date: Mapped[date | None] = mapped_column(Date)
+    estimated_end_date: Mapped[date | None] = mapped_column(Date)
+    responsible_master_user_id: Mapped[UUID | None] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), index=True
+    )
+    responsible_master: Mapped[User | None] = relationship(
+        foreign_keys=[responsible_master_user_id]
+    )
+    photo_url: Mapped[str | None] = mapped_column(String(128))
+    photo_is_demo: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("false"), nullable=False
+    )
     address: Mapped[str] = mapped_column(Text, nullable=False)
     latitude: Mapped[float | None] = mapped_column(Float)
     longitude: Mapped[float | None] = mapped_column(Float)

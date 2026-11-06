@@ -4,6 +4,7 @@ from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
+from backend import notes as notes_models  # noqa: F401
 from backend.access import models as access_models  # noqa: F401
 from backend.communications import models as communications_models  # noqa: F401
 from backend.core.config import get_settings

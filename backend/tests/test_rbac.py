@@ -19,8 +19,6 @@ def test_permission_matrix_is_explicit_for_all_roles() -> None:
 
 def test_admin_financial_secrets_are_denied() -> None:
     forbidden = {
-        Permission.EXPENSE_READ,
-        Permission.EXPENSE_MANAGE,
         Permission.WORKER_BANK_READ_ALL,
         Permission.REVENUE_READ,
         Permission.REVENUE_MANAGE,
@@ -32,6 +30,9 @@ def test_admin_financial_secrets_are_denied() -> None:
     }
     assert forbidden.isdisjoint(ROLE_PERMISSIONS[UserRole.ADMIN])
     assert forbidden.issubset(ROLE_PERMISSIONS[UserRole.BOSS])
+    assert has_permission(UserRole.ADMIN, Permission.EXPENSE_READ)
+    assert has_permission(UserRole.ADMIN, Permission.EXPENSE_MANAGE)
+    assert not has_permission(UserRole.ADMIN, Permission.EXPENSE_APPROVE)
 
 
 def test_master_has_team_read_without_write_or_money() -> None:
@@ -93,3 +94,8 @@ async def test_denied_permission_is_audited(context: AppContext) -> None:
         ).scalar_one()
     assert event.actor_user_id == admin.id
     assert event.metadata_json == {"permission": "profit:read", "role": "ADMIN"}
+
+
+@pytest.mark.parametrize("role", list(UserRole))
+def test_only_boss_can_manage_objects(role: UserRole) -> None:
+    assert has_permission(role, Permission.OBJECT_MANAGE) is (role == UserRole.BOSS)

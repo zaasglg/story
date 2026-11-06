@@ -45,7 +45,7 @@ async def test_salary_account_permissions_encryption_and_lifecycle(context):
     public = await context.client.get("/api/v1/workers/public", headers=headers[UserRole.MASTER])
     assert normalized not in public.text and "iban" not in public.text
     invalid = await context.client.put(
-        path, headers=headers[UserRole.BOSS], json={**account, "iban": "KZ00125KZT5004100100"}
+        path, headers=headers[UserRole.BOSS], json={**account, "iban": "   "}
     )
     assert invalid.status_code == 422
     unchanged = await context.client.get(path, headers=headers[UserRole.BOSS])

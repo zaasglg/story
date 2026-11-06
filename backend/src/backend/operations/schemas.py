@@ -23,6 +23,26 @@ class TariffCreate(BaseModel):
     rate_per_m3: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
     currency: str = Field(default="RUB", pattern=r"^[A-Z]{3}$")
     effective_from: date
+    effective_to: date | None = None
+
+    @model_validator(mode="after")
+    def validate_period(self):
+        if self.effective_to is not None and self.effective_to < self.effective_from:
+            raise ValueError("End date must be on or after start date")
+        return self
+
+
+class TariffUpdate(BaseModel):
+    rate_per_m3: Decimal = Field(gt=0, max_digits=12, decimal_places=2)
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    effective_from: date
+    effective_to: date | None = None
+
+    @model_validator(mode="after")
+    def validate_period(self):
+        if self.effective_to is not None and self.effective_to < self.effective_from:
+            raise ValueError("End date must be on or after start date")
+        return self
 
 
 class TariffRead(TariffCreate):
@@ -105,12 +125,14 @@ class WorkDayCreate(BaseModel):
     work_date: date
     check_in: datetime | None = None
     check_out: datetime | None = None
-    hours: Decimal = Field(ge=0, le=24, max_digits=8, decimal_places=2)
-    m3: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
+    hours: Decimal = Field(default=Decimal("0"), ge=0, le=24, max_digits=8, decimal_places=2)
+    m3: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2)
     status: WorkDayStatus = WorkDayStatus.DRAFT
 
     @model_validator(mode="after")
     def validate_times(self) -> "WorkDayCreate":
+        if self.hours <= 0 and self.m3 <= 0:
+            raise ValueError("Enter hours or volume greater than zero")
         if (
             self.check_in
             and self.check_out

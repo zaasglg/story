@@ -9,6 +9,7 @@ from sqlalchemy import text
 from backend.access.attendance_views import router as attendance_views_router
 from backend.access.live import router as attendance_live_router
 from backend.access.master_dashboard import router as master_dashboard_router
+from backend.access.permits import router as permits_router
 from backend.access.routes import router as access_router
 from backend.access.shifts import router as shifts_router
 from backend.audit.routes import router as audit_router
@@ -25,6 +26,7 @@ from backend.equipment.routes import router as equipment_router
 from backend.finance.company import router as company_router
 from backend.finance.payroll import router as payroll_router
 from backend.finance.personal_banks import router as personal_banks_router
+from backend.finance.receipts import router as receipts_router
 from backend.finance.routes import router as finance_router
 from backend.identity.admin_accounts import router as admin_accounts_router
 from backend.identity.otp import RateLimiter, RedisRateLimiter
@@ -32,6 +34,7 @@ from backend.identity.routes import router as identity_router
 from backend.identity.service import AuthService
 from backend.management.catalog import router as catalog_router
 from backend.management.dashboard import router as admin_dashboard_router
+from backend.notes import router as notes_router
 from backend.operations.dashboard import router as dashboard_router
 from backend.operations.object_calendar import router as object_calendar_router
 from backend.operations.production import router as production_router
@@ -41,6 +44,7 @@ from backend.workforce.directory import router as directory_router
 from backend.workforce.documents import router as documents_router
 from backend.workforce.maps import AddressGeocoder
 from backend.workforce.maps import router as maps_router
+from backend.workforce.object_files import router as object_files_router
 from backend.workforce.photos import router as photos_router
 from backend.workforce.routes import router as workforce_router
 
@@ -114,6 +118,10 @@ def create_app(
     app.include_router(attendance_live_router, prefix=app_settings.api_prefix)
     app.include_router(shifts_router, prefix=app_settings.api_prefix)
     app.include_router(access_router, prefix=app_settings.api_prefix)
+    app.include_router(object_files_router, prefix=app_settings.api_prefix)
+    app.include_router(receipts_router, prefix=app_settings.api_prefix)
+    app.include_router(notes_router, prefix=app_settings.api_prefix)
+    app.include_router(permits_router, prefix=app_settings.api_prefix)
     app.include_router(communications_router, prefix=app_settings.api_prefix)
     app.include_router(push_router, prefix=app_settings.api_prefix)
     app.include_router(catalog_router, prefix=app_settings.api_prefix)

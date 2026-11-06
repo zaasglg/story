@@ -73,7 +73,9 @@ async def prepare_assignment(
     assert brigade.status_code == 201, brigade.text
     obj = await context.client.post(
         "/api/v1/admin/objects",
-        headers=auth(admin_tokens),
+        headers={
+            "Authorization": f"Bearer {(await login(context, UserRole.BOSS))['access_token']}"
+        },
         json={
             "name": "Operations Object",
             "city_id": city_id,
@@ -196,6 +198,12 @@ async def test_historical_tariff_and_role_safe_work_days(context: AppContext) ->
     )
     assert master_edit.status_code == 403
     assert boss_edit.status_code == 403
+    worker_edit = await context.client.patch(
+        f"/api/v1/admin/work-days/{work_day_id}",
+        headers=auth(worker_tokens),
+        json={"hours": "12.00", "m3": "99.00"},
+    )
+    assert worker_edit.status_code == 403
 
     updated = await context.client.patch(
         f"/api/v1/admin/work-days/{work_day_id}",

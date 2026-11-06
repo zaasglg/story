@@ -1,12 +1,17 @@
 from decimal import Decimal
 
 from conftest import AppContext, login
+from sqlalchemy import select
 from test_operations_api import auth
 
-from backend.identity.models import UserRole
+from backend.core.time import utc_now
+from backend.identity.models import User, UserRole
+from backend.operations.models import ProductionEntry
 
 
-async def test_worker_records_volume_and_reads_statistics(context: AppContext) -> None:
+async def test_worker_cannot_record_volume_and_can_read_legacy_statistics(
+    context: AppContext,
+) -> None:
     worker = auth(await login(context, UserRole.WORKER))
     first = await context.client.post(
         "/api/v1/workers/me/production",
@@ -18,11 +23,22 @@ async def test_worker_records_volume_and_reads_statistics(context: AppContext) -
         headers=worker,
         json={"volume_m3": "3.20"},
     )
-    assert first.status_code == second.status_code == 201
+    assert first.status_code == second.status_code == 403
+    async with context.database.session_factory() as session:
+        user = await session.scalar(select(User).where(User.role == UserRole.WORKER))
+        session.add_all(
+            [
+                ProductionEntry(
+                    worker_user_id=user.id, volume_m3=Decimal("4.50"), recorded_at=utc_now()
+                ),
+                ProductionEntry(
+                    worker_user_id=user.id, volume_m3=Decimal("3.20"), recorded_at=utc_now()
+                ),
+            ]
+        )
+        await session.commit()
 
-    journal = (
-        await context.client.get("/api/v1/workers/me/production", headers=worker)
-    ).json()
+    journal = (await context.client.get("/api/v1/workers/me/production", headers=worker)).json()
     assert Decimal(journal["today_total"]) == Decimal("7.70")
     assert [Decimal(row["volume_m3"]) for row in journal["entries"]] == [
         Decimal("3.20"),
@@ -30,9 +46,7 @@ async def test_worker_records_volume_and_reads_statistics(context: AppContext) -
     ]
 
     stats = (
-        await context.client.get(
-            "/api/v1/workers/me/production/stats?period=week", headers=worker
-        )
+        await context.client.get("/api/v1/workers/me/production/stats?period=week", headers=worker)
     ).json()
     assert Decimal(stats["total_m3"]) == Decimal("7.70")
     assert stats["active_days"] == 1

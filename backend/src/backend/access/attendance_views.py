@@ -127,6 +127,7 @@ async def attendance_summary(
     city_id: UUID | None = None,
     limit: int = Query(default=25, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    q: str = Query(default="", max_length=255),
 ) -> dict:
     now = utc_now()
     day = work_date or now.astimezone(ZoneInfo("Europe/Moscow")).date()
@@ -164,6 +165,15 @@ async def attendance_summary(
             )
         ).all()
     )
+    profiles = {
+        row.user_id: row
+        for row in (
+            await session.scalars(
+                select(EmployeeProfile).where(EmployeeProfile.user_id.in_(worker_ids))
+            )
+        ).all()
+    }
+    city_names = dict((await session.execute(select(City.id, City.name))).all())
     items = []
     for worker_id in worker_ids:
         item, plan = by_worker.get(worker_id), plans.get(worker_id)
@@ -228,8 +238,13 @@ async def attendance_summary(
                 else None,
                 "timezone": zone.key,
                 "scheduled": plan is not None,
+                "photo_url": profiles[worker_id].photo_url if worker_id in profiles else None,
+                "city_name": city_names.get(item_city),
             }
         )
+    if q.strip():
+        term = q.strip().casefold()
+        items = [row for row in items if term in row["worker_name"].casefold()]
     items.sort(key=lambda row: (row["worker_name"].casefold(), str(row["worker_user_id"])))
     counts = {
         state: sum(row["state"] == state for row in items)

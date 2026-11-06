@@ -157,18 +157,30 @@ async def test_redis_publish_failure_does_not_fail_committed_message(context: Ap
     assert "private-redis-password" not in caplog.text
 
 
-async def test_worker_cannot_list_read_send_or_subscribe_general_chat(context: AppContext):
+async def test_worker_can_read_but_cannot_send_to_general_chat(context: AppContext):
     tokens = await login(context, UserRole.WORKER)
     headers = {"Authorization": f"Bearer {tokens['access_token']}"}
     thread = await general(context)
     chats = await context.client.get("/api/v1/chats", headers=headers)
     assert chats.status_code == 200
-    assert all(item["key"] != "GENERAL" for item in chats.json())
+    general_chat = next(item for item in chats.json() if item["key"] == "GENERAL")
+    assert general_chat["can_write"] is False
     path = f"/api/v1/chats/{thread}/messages"
-    assert (await context.client.get(path, headers=headers)).status_code == 404
+    assert (await context.client.get(path, headers=headers)).status_code == 200
     response = await context.client.post(
         path, headers=headers, json={"body": "denied", "client_message_id": str(uuid4())}
     )
-    assert response.status_code == 404
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "chat_read_only"
+    voice = await context.client.post(
+        f"/api/v1/chats/{thread}/voice",
+        headers=headers,
+        data={"client_message_id": str(uuid4()), "duration_ms": 1000},
+        files={"file": ("voice.ogg", b"OggS" + b"0" * 64, "audio/ogg")},
+    )
+    assert voice.status_code == 403
+    assert voice.json()["error"]["code"] == "chat_read_only"
     async with SocketProbe(context.client._transport.app, thread) as socket:
-        assert (await socket.auth(tokens["access_token"]))["code"] == 1008
+        assert json.loads((await socket.auth(tokens["access_token"]))["text"]) == {
+            "type": "ready"
+        }

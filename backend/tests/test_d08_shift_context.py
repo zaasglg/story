@@ -30,7 +30,9 @@ async def test_open_shift_blocks_transfer_and_checkout_uses_original_snapshot(co
     obj = (
         await context.client.post(
             "/api/v1/admin/objects",
-            headers=auth(admin),
+            headers={
+                "Authorization": f"Bearer {(await login(context, UserRole.BOSS))['access_token']}"
+            },
             json={"name": "Synthetic target", "city_id": old["city_id"], "address": "Synthetic"},
         )
     ).json()
@@ -85,7 +87,9 @@ async def test_postgres_scan_and_transfer_share_a_serialized_context(context):
     obj = (
         await context.client.post(
             "/api/v1/admin/objects",
-            headers=auth(admin),
+            headers={
+                "Authorization": f"Bearer {(await login(context, UserRole.BOSS))['access_token']}"
+            },
             json={"name": "Concurrent target", "city_id": old["city_id"], "address": "Synthetic"},
         )
     ).json()

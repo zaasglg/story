@@ -27,6 +27,7 @@ from backend.workforce.models import (
     ProfileChangeRequest,
     WorkerAssignment,
     WorkObject,
+    WorkObjectPhoto,
 )
 from backend.workforce.request_pii import protect_changes, request_read, reveal_changes
 from backend.workforce.schemas import (
@@ -398,23 +399,40 @@ async def get_master_objects(
         await session.scalars(
             select(WorkObject)
             .where(WorkObject.id.in_(object_ids), WorkObject.archived_at.is_(None))
-            .options(selectinload(WorkObject.city))
+            .options(
+                selectinload(WorkObject.city),
+                selectinload(WorkObject.responsible_master).selectinload(User.profile),
+            )
         )
     ).all()
     return [object_read(x) for x in rows]
 
 
 @router.get("/admin/workers", response_model=list[WorkerPrivateRead])
-@router.get("/boss/workers", response_model=list[WorkerPrivateRead])
 async def list_all_workers(
     session: Session,
     settings: SettingsDep,
     _: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_READ_ALL))],
 ) -> list[WorkerPrivateRead]:
+    return await employee_directory(session, settings, (UserRole.WORKER,))
+
+
+@router.get("/boss/workers", response_model=list[WorkerPrivateRead])
+async def list_boss_employees(
+    session: Session,
+    settings: SettingsDep,
+    _: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_READ_ALL))],
+) -> list[WorkerPrivateRead]:
+    return await employee_directory(session, settings, (UserRole.WORKER, UserRole.MASTER))
+
+
+async def employee_directory(
+    session: AsyncSession, settings: Settings, roles: tuple[UserRole, ...]
+) -> list[WorkerPrivateRead]:
     users = (
         await session.scalars(
             select(User)
-            .where(User.role == UserRole.WORKER, User.archived_at.is_(None))
+            .where(User.role.in_(roles), User.archived_at.is_(None))
             .options(selectinload(User.profile))
             .order_by(User.created_at)
         )
@@ -679,6 +697,38 @@ async def list_masters(
     return [await public_projection(session, user) for user in users if user.profile]
 
 
+@router.get("/boss/masters", response_model=list[WorkerPublicRead])
+async def list_object_masters(
+    session: Session,
+    _: Annotated[CurrentUser, Depends(require_permission(Permission.OBJECT_MANAGE))],
+) -> list[WorkerPublicRead]:
+    masters = (
+        await session.scalars(
+            select(User)
+            .where(
+                User.role == UserRole.MASTER,
+                User.status == AccountStatus.ACTIVE,
+                User.archived_at.is_(None),
+            )
+            .options(selectinload(User.profile))
+        )
+    ).all()
+    return [await public_projection(session, user) for user in masters if user.profile]
+
+
+async def validate_responsible_master(session: AsyncSession, master_id: UUID | None) -> None:
+    if master_id is None:
+        return
+    master = await session.get(User, master_id)
+    if (
+        master is None
+        or master.role != UserRole.MASTER
+        or master.status != AccountStatus.ACTIVE
+        or master.archived_at is not None
+    ):
+        raise ApiError(422, "invalid_master", "Choose an active master")
+
+
 def brigade_read(item: Brigade) -> BrigadeRead:
     return BrigadeRead(
         id=item.id,
@@ -693,9 +743,21 @@ def brigade_read(item: Brigade) -> BrigadeRead:
 def object_read(item: WorkObject) -> WorkObjectRead:
     return WorkObjectRead(
         id=item.id,
+        planned_hours=item.planned_hours,
+        planned_volume_m3=item.planned_volume_m3,
+        progress_unit=item.progress_unit,
+        planned_quantity=item.planned_quantity,
+        start_date=item.start_date,
+        estimated_end_date=item.estimated_end_date,
+        responsible_master_user_id=item.responsible_master_user_id,
+        responsible_master_name=item.responsible_master.profile.full_name
+        if item.responsible_master and item.responsible_master.profile
+        else None,
         name=item.name,
         city_id=item.city_id,
         city_name=item.city.name,
+        photo_url=item.photo_url,
+        photo_is_demo=item.photo_is_demo,
         address=item.address,
         latitude=item.latitude,
         longitude=item.longitude,
@@ -855,21 +917,26 @@ async def list_objects(
         await session.scalars(
             select(WorkObject)
             .where(WorkObject.archived_at.is_(None))
-            .options(selectinload(WorkObject.city))
+            .options(
+                selectinload(WorkObject.city),
+                selectinload(WorkObject.responsible_master).selectinload(User.profile),
+            )
             .order_by(WorkObject.name)
         )
     ).all()
     return [object_read(x) for x in rows]
 
 
+@router.post("/boss/objects", response_model=WorkObjectRead, status_code=201)
 @router.post("/admin/objects", response_model=WorkObjectRead, status_code=201)
 async def create_object(
     payload: WorkObjectCreate,
     request: Request,
     session: Session,
-    current: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.OBJECT_MANAGE))],
 ) -> WorkObjectRead:
     await require_city(session, payload.city_id)
+    await validate_responsible_master(session, payload.responsible_master_user_id)
     now = utc_now()
     item = WorkObject(**payload.model_dump(), created_at=now, updated_at=now)
     session.add(item)
@@ -881,18 +948,22 @@ async def create_object(
             await session.execute(
                 select(WorkObject)
                 .where(WorkObject.id == item.id)
-                .options(selectinload(WorkObject.city))
+                .options(
+                    selectinload(WorkObject.city),
+                    selectinload(WorkObject.responsible_master).selectinload(User.profile),
+                )
             )
         ).scalar_one()
     )
 
 
+@router.delete("/boss/objects/{object_id}", status_code=204)
 @router.delete("/admin/objects/{object_id}", status_code=204)
 async def archive_object(
     object_id: UUID,
     request: Request,
     session: Session,
-    current: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.OBJECT_MANAGE))],
 ) -> Response:
     item = await session.get(WorkObject, object_id, with_for_update=True)
     if item is None or item.archived_at is not None:
@@ -904,21 +975,30 @@ async def archive_object(
     return Response(status_code=204)
 
 
+@router.patch("/boss/objects/{object_id}", response_model=WorkObjectRead)
 @router.patch("/admin/objects/{object_id}", response_model=WorkObjectRead)
 async def update_object(
     object_id: UUID,
     payload: WorkObjectUpdate,
     request: Request,
     session: Session,
-    current: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_MANAGE))],
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.OBJECT_MANAGE))],
 ) -> WorkObjectRead:
     item = await session.get(WorkObject, object_id, with_for_update=True)
     if item is None or item.archived_at is not None:
         raise ApiError(404, "object_not_found", "Object was not found")
     values = payload.model_dump(exclude_unset=True)
+    start = values.get("start_date", item.start_date)
+    end = values.get("estimated_end_date", item.estimated_end_date)
+    if start is not None and end is not None and end < start:
+        raise ApiError(
+            422, "invalid_object_dates", "Estimated end date must not precede start date"
+        )
+    if "responsible_master_user_id" in values:
+        await validate_responsible_master(session, values["responsible_master_user_id"])
     if "address" in values and values["address"] != item.address and "latitude" not in values:
         values.update(latitude=None, longitude=None)
-    if values.get("city_id") is not None:
+    if values.get("city_id") is not None and values["city_id"] != item.city_id:
         await require_city(session, values["city_id"])
         conflict = await session.scalar(
             select(WorkerAssignment.id)
@@ -952,7 +1032,10 @@ async def update_object(
         await session.execute(
             select(WorkObject)
             .where(WorkObject.id == item.id)
-            .options(selectinload(WorkObject.city))
+            .options(
+                selectinload(WorkObject.city),
+                selectinload(WorkObject.responsible_master).selectinload(User.profile),
+            )
         )
     ).scalar_one()
     return object_read(loaded)
@@ -1116,3 +1199,23 @@ async def delete_salary_account(
         private.updated_at = utc_now()
     audit(request, session, current, "SALARY_ACCOUNT_DELETED", "worker", worker_id)
     await session.commit()
+
+
+@router.get("/object-photos/{object_id}")
+async def read_object_photo(
+    object_id: UUID,
+    session: Session,
+    _: Annotated[CurrentUser, Depends(require_permission(Permission.ORGANIZATION_READ))],
+) -> Response:
+    photo = await session.get(WorkObjectPhoto, object_id)
+    item = await session.get(WorkObject, object_id)
+    if photo is None or item is None or item.archived_at is not None:
+        raise ApiError(404, "photo_not_found", "Photo was not found")
+    return Response(
+        photo.content,
+        media_type="image/png" if photo.content.startswith(b"\x89PNG") else "image/jpeg",
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

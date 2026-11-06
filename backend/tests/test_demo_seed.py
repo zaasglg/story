@@ -3,6 +3,7 @@ from datetime import date
 from conftest import AppContext, login
 from sqlalchemy import func, select
 
+from backend.demo_calendar import populate_calendar
 from backend.demo_seed import populate_demo
 from backend.identity.models import Base, UserRole
 from backend.management.catalog import RESOURCES
@@ -70,9 +71,6 @@ async def test_demo_seed_is_linked_and_repeatable(context: AppContext) -> None:
     for name in RESOURCES:
         path = f"/api/v1/admin/catalog/{name}"
         response = await context.client.get(path, headers=admin_headers, params={"limit": 2})
-        if name == "expenses":
-            assert response.status_code == 403
-            continue
         assert response.status_code == 200, (name, response.text)
         page = response.json()
         assert len(page["items"]) <= 2
@@ -85,3 +83,11 @@ async def test_demo_seed_is_linked_and_repeatable(context: AppContext) -> None:
                 path, headers=admin_headers, params={"sort": sort, "q": "a", "limit": 1}
             )
             assert sorted_page.status_code == 200, (name, sorted_page.text)
+    async with context.database.session_factory() as session:
+        assert await populate_calendar(session, date(2026, 11, 6)) == 3
+        assert await populate_calendar(session, date(2026, 11, 6)) == 0
+    examples = await context.client.get(
+        "/api/v1/admin/catalog/object-calendar", headers=admin_headers
+    )
+    assert examples.json()["total"] == 3
+    assert all(row["reason"].startswith("Демо:") for row in examples.json()["items"])

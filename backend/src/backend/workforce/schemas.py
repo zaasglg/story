@@ -1,4 +1,6 @@
 from datetime import date, datetime
+from decimal import Decimal
+from typing import Literal
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -143,7 +145,42 @@ class ObjectCoordinates(BaseModel):
         return self
 
 
-class WorkObjectCreate(ObjectCoordinates):
+class ObjectSchedule(ObjectCoordinates):
+    planned_hours: Decimal | None = Field(
+        default=None, gt=0, max_digits=14, decimal_places=2, allow_inf_nan=False
+    )
+    planned_volume_m3: Decimal | None = Field(
+        default=None, gt=0, max_digits=14, decimal_places=2, allow_inf_nan=False
+    )
+    progress_unit: Literal["hours", "m3"] | None = None
+    planned_quantity: Decimal | None = Field(
+        default=None, gt=0, max_digits=14, decimal_places=2, allow_inf_nan=False
+    )
+
+    @model_validator(mode="after")
+    def paired_progress_plan(self) -> "ObjectSchedule":
+        if ("progress_unit" in self.model_fields_set) != (
+            "planned_quantity" in self.model_fields_set
+        ) or (self.progress_unit is None) != (self.planned_quantity is None):
+            raise ValueError("Submit progress unit and planned quantity together")
+        return self
+
+    start_date: date | None = None
+    estimated_end_date: date | None = None
+    responsible_master_user_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def ordered_dates(self) -> "ObjectSchedule":
+        if (
+            self.start_date
+            and self.estimated_end_date
+            and self.estimated_end_date < self.start_date
+        ):
+            raise ValueError("Estimated end date must not precede start date")
+        return self
+
+
+class WorkObjectCreate(ObjectSchedule):
     name: str = Field(min_length=1, max_length=255)
     city_id: UUID
     address: str = Field(min_length=1, max_length=2000)
@@ -151,12 +188,15 @@ class WorkObjectCreate(ObjectCoordinates):
 
 
 class WorkObjectRead(WorkObjectCreate):
+    responsible_master_name: str | None = None
+    photo_url: str | None = None
+    photo_is_demo: bool = False
     id: UUID
     city_name: str
     archived_at: datetime | None
 
 
-class WorkObjectUpdate(ObjectCoordinates):
+class WorkObjectUpdate(ObjectSchedule):
     name: str | None = Field(default=None, min_length=1, max_length=255)
     city_id: UUID | None = None
     address: str | None = Field(default=None, min_length=1, max_length=2000)
@@ -198,18 +238,13 @@ class ChangeRequestDecision(BaseModel):
 class SalaryAccountWrite(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     bank_name: str = Field(min_length=1, max_length=255)
-    iban: str = Field(min_length=15, max_length=80, repr=False)
+    iban: str = Field(min_length=1, max_length=80, repr=False)
     account_holder: str = Field(min_length=1, max_length=255)
 
     @field_validator("iban")
     @classmethod
     def valid_iban(cls, value: str) -> str:
-        import re
-
         value = "".join(value.split()).upper()
-        if not re.fullmatch(r"[A-Z]{2}[0-9]{2}[A-Z0-9]{11,30}", value):
-            raise ValueError("Invalid IBAN format")
-        digits = "".join(str(ord(c) - 55) if c.isalpha() else c for c in value[4:] + value[:4])
-        if int(digits) % 97 != 1:
-            raise ValueError("Invalid IBAN checksum")
+        if not value:
+            raise ValueError("Account number is required")
         return value

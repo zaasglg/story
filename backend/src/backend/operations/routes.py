@@ -4,8 +4,8 @@ from typing import Annotated
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, Request, Response
-from sqlalchemy import or_, select
+from fastapi import APIRouter, Depends, Query, Request, Response
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -35,6 +35,7 @@ from backend.operations.schemas import (
     ScheduleUpdate,
     TariffCreate,
     TariffRead,
+    TariffUpdate,
     WorkDayCreate,
     WorkDayPrivateRead,
     WorkDayTeamRead,
@@ -287,6 +288,12 @@ async def update_work_day(
     check_out = values.get("check_out", item.check_out)
     if check_in and check_out and ensure_utc(check_out) <= ensure_utc(check_in):
         raise ApiError(422, "invalid_work_time", "Check-out must be after check-in")
+    if (
+        {"hours", "m3"} & values.keys()
+        and values.get("hours", item.hours) <= 0
+        and values.get("m3", item.m3) <= 0
+    ):
+        raise ApiError(422, "invalid_work_result", "Enter hours or volume greater than zero")
     for field, value in values.items():
         setattr(item, field, value)
     item.daily_earnings = (item.m3 * item.rate_per_m3).quantize(
@@ -356,7 +363,9 @@ async def create_tariff(
     session: Session,
     current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKDAY_MANAGE))],
 ) -> TariffRead:
-    obj = await session.get(WorkObject, payload.object_id)
+    obj = await session.scalar(
+        select(WorkObject).where(WorkObject.id == payload.object_id).with_for_update()
+    )
     if obj is None or obj.archived_at is not None:
         raise ApiError(404, "object_not_found", "Object was not found")
     previous = await session.scalar(
@@ -370,6 +379,10 @@ async def create_tariff(
         raise ApiError(409, "tariff_date_conflict", "New tariff must start after current tariff")
     if previous:
         previous.effective_to = payload.effective_from - timedelta(days=1)
+        await session.flush()
+    await check_tariff_period(
+        session, payload.object_id, payload.effective_from, payload.effective_to
+    )
     now = utc_now()
     item = TariffHistory(**payload.model_dump(), created_by=current.id, created_at=now)
     session.add(item)
@@ -381,7 +394,47 @@ async def create_tariff(
         **payload.model_dump(),
         id=item.id,
         object_name=obj.name,
-        effective_to=item.effective_to,
+    )
+
+
+async def check_tariff_period(session, object_id, start, end, exclude_id=None):
+    query = select(TariffHistory.id).where(
+        TariffHistory.object_id == object_id,
+        TariffHistory.archived_at.is_(None),
+        or_(TariffHistory.effective_to.is_(None), TariffHistory.effective_to >= start),
+    )
+    if end is not None:
+        query = query.where(TariffHistory.effective_from <= end)
+    if exclude_id is not None:
+        query = query.where(TariffHistory.id != exclude_id)
+    if await session.scalar(query.limit(1)):
+        raise ApiError(409, "tariff_date_conflict", "Tariff periods must not overlap")
+
+
+@router.patch("/admin/tariffs/{item_id}", response_model=TariffRead)
+async def update_tariff(
+    item_id: UUID,
+    payload: TariffUpdate,
+    request: Request,
+    session: Session,
+    current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKDAY_MANAGE))],
+) -> TariffRead:
+    item = await session.get(TariffHistory, item_id)
+    if item is None or item.archived_at is not None:
+        raise ApiError(404, "tariff_not_found", "Tariff was not found")
+    obj = await session.scalar(
+        select(WorkObject).where(WorkObject.id == item.object_id).with_for_update()
+    )
+    await session.refresh(item)
+    await check_tariff_period(
+        session, item.object_id, payload.effective_from, payload.effective_to, item.id
+    )
+    for key, value in payload.model_dump().items():
+        setattr(item, key, value)
+    audit(request, session, current, "TARIFF_UPDATED", "tariff", item.id)
+    await session.commit()
+    return TariffRead(
+        **payload.model_dump(), id=item.id, object_id=item.object_id, object_name=obj.name
     )
 
 
@@ -642,3 +695,61 @@ async def archive_attendance(
     await sync_attendance_rating(session, item.worker_user_id, current.id)
     await session.commit()
     return Response(status_code=204)
+
+
+@router.get("/objects/{object_id}/work-progress")
+async def object_work_progress(
+    object_id: UUID,
+    session: Session,
+    _: Annotated[CurrentUser, Depends(require_permission(Permission.WORKDAY_READ_ALL))],
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+) -> dict:
+    work_object = await session.get(WorkObject, object_id)
+    if work_object is None or work_object.archived_at is not None:
+        raise ApiError(404, "object_not_found", "Object was not found")
+    filters = (WorkDay.object_id == object_id, WorkDay.archived_at.is_(None))
+    total = await session.scalar(select(func.count()).select_from(WorkDay).where(*filters))
+    totals = (
+        await session.execute(
+            select(func.sum(WorkDay.hours), func.sum(WorkDay.m3)).where(
+                *filters, WorkDay.status == "APPROVED"
+            )
+        )
+    ).one()
+    rows = (
+        await session.scalars(
+            work_day_query()
+            .where(*filters)
+            .order_by(WorkDay.work_date.desc(), WorkDay.id)
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    items = []
+    for row in rows:
+        item = (await team_projection(session, row)).model_dump(mode="json")
+        profile = await session.scalar(
+            select(EmployeeProfile).where(EmployeeProfile.user_id == row.worker_user_id)
+        )
+        item["photo_url"] = profile.photo_url if profile else None
+        items.append(item)
+    completed_hours = Decimal(totals[0] or 0)
+    completed_volume = Decimal(totals[1] or 0)
+    return {
+        "items": items,
+        "total": total,
+        "hours": str(completed_hours),
+        "m3": str(completed_volume),
+        "status": work_object.status,
+        "planned_hours": str(work_object.planned_hours) if work_object.planned_hours else None,
+        "planned_volume_m3": str(work_object.planned_volume_m3)
+        if work_object.planned_volume_m3
+        else None,
+        "remaining_hours": str(max(Decimal(0), work_object.planned_hours - completed_hours))
+        if work_object.planned_hours
+        else None,
+        "remaining_m3": str(max(Decimal(0), work_object.planned_volume_m3 - completed_volume))
+        if work_object.planned_volume_m3
+        else None,
+    }

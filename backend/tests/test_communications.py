@@ -124,7 +124,8 @@ async def test_announcements_and_support_role_scope(context: AppContext) -> None
     )
     assert resolved.json()["status"] == "RESOLVED"
     chats = await context.client.get("/api/v1/chats", headers=worker)
-    assert all(item["key"] != "GENERAL" for item in chats.json())
+    general_chat = next(item for item in chats.json() if item["key"] == "GENERAL")
+    assert general_chat["can_write"] is False
     chats = await context.client.get("/api/v1/chats", headers=admin)
     general_id = next(item["id"] for item in chats.json() if item["key"] == "GENERAL")
     sent = await context.client.post(

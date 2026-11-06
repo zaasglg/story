@@ -285,6 +285,7 @@ class ThreadRead(BaseModel):
     peer_role: str | None = None
     last_message: str | None = None
     last_message_at: datetime | None = None
+    can_write: bool = True
 
 
 class ChatContactRead(BaseModel):
@@ -368,6 +369,7 @@ async def thread_views(
     result = []
     for item in threads:
         view = ThreadRead.model_validate(item)
+        view.can_write = not (item.key == "GENERAL" and actor.role == UserRole.WORKER)
         peer = peers.get(item.user_two_id if item.user_one_id == actor.id else item.user_one_id)
         if peer:
             view.peer_name = peer.full_name or "Пользователь"
@@ -406,10 +408,8 @@ async def master_contact_allowed(session: AsyncSession, actor: CurrentUser, peer
 
 async def require_thread(session: AsyncSession, thread_id: UUID, actor: CurrentUser) -> ChatThread:
     item = await session.get(ChatThread, thread_id)
-    if (
-        item is None
-        or (item.key == "GENERAL" and actor.role == UserRole.WORKER)
-        or (item.key != "GENERAL" and actor.id not in (item.user_one_id, item.user_two_id))
+    if item is None or (
+        item.key != "GENERAL" and actor.id not in (item.user_one_id, item.user_two_id)
     ):
         raise ApiError(404, "chat_not_found", "Chat was not found")
     if item.key != "GENERAL":
@@ -427,7 +427,7 @@ async def chats(session: Session, actor: Chatter) -> list[ThreadRead]:
                 select(ChatThread)
                 .where(
                     or_(
-                        (ChatThread.key == "GENERAL") & (actor.role != UserRole.WORKER),
+                        ChatThread.key == "GENERAL",
                         ChatThread.user_one_id == actor.id,
                         ChatThread.user_two_id == actor.id,
                     )
@@ -575,6 +575,8 @@ async def send_message(
     thread_id: UUID, payload: MessageCreate, session: Session, actor: Chatter, request: Request
 ) -> MessageRead:
     thread = await require_thread(session, thread_id, actor)
+    if thread.key == "GENERAL" and actor.role == UserRole.WORKER:
+        raise ApiError(403, "chat_read_only", "This chat is read-only")
     query = select(ChatMessage).where(
         ChatMessage.thread_id == thread_id,
         ChatMessage.sender_user_id == actor.id,
@@ -627,6 +629,8 @@ async def send_voice(
     duration_ms: Annotated[int, Form(ge=500, le=300000)],
 ) -> MessageRead:
     thread = await require_thread(session, thread_id, actor)
+    if thread.key == "GENERAL" and actor.role == UserRole.WORKER:
+        raise ApiError(403, "chat_read_only", "This chat is read-only")
     content = await file.read(5 * 1024 * 1024 + 1)
     await file.close()
     if len(content) > 5 * 1024 * 1024:

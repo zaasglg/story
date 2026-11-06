@@ -32,7 +32,7 @@ async def test_master_public_directory_is_team_scoped(context):
         ):
             assert (
                 await context.client.get(f"/api/v1{path}", headers=headers[role])
-            ).status_code == 403
+            ).status_code == (200 if role == UserRole.ADMIN and path.endswith("/expenses") else 403)
 
     async with context.database.session_factory() as session:
         master_id = await session.scalar(select(User.id).where(User.role == UserRole.MASTER))

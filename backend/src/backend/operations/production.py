@@ -9,6 +9,7 @@ from sqlalchemy import or_, select
 
 from backend.authorization.dependencies import require_permission
 from backend.authorization.permissions import Permission
+from backend.core.errors import ApiError
 from backend.core.time import ensure_utc, utc_now
 from backend.identity.dependencies import CurrentUser
 from backend.operations.models import ProductionEntry
@@ -93,22 +94,8 @@ async def daily_values(session, actor, start_day, end_day, timezone):
 
 @router.post("/workers/me/production", response_model=EntryRead, status_code=201)
 async def create_entry(payload: EntryCreate, session: Session, actor: OwnWorker) -> EntryRead:
-    await require_worker(session, actor.id)
-    assignment = await active_assignment(session, actor.id)
-    zone = await worker_timezone(session, actor)
-    item = ProductionEntry(
-        object_id=assignment.object_id if assignment else None,
-        timezone=zone.key,
-        worker_user_id=actor.id,
-        volume_m3=payload.volume_m3,
-        note=payload.note.strip() if payload.note and payload.note.strip() else None,
-        recorded_at=utc_now(),
-    )
-    session.add(item)
-    await session.commit()
-    await session.refresh(item)
-    return EntryRead(
-        id=str(item.id), volume_m3=item.volume_m3, note=item.note, recorded_at=item.recorded_at
+    raise ApiError(
+        403, "production_entry_admin_only", "Only an administrator can enter daily work results"
     )
 
 

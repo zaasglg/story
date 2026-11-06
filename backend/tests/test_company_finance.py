@@ -17,7 +17,9 @@ async def test_boss_finance_approval_totals_and_forbidden_roles(context: AppCont
     city = (await context.client.get("/api/v1/cities", headers=admin)).json()[0]["id"]
     obj = await context.client.post(
         "/api/v1/admin/objects",
-        headers=admin,
+        headers={
+            "Authorization": f"Bearer {(await login(context, UserRole.BOSS))['access_token']}"
+        },
         json={"name": "Profit Object", "city_id": city, "address": "Lipetsk"},
     )
     object_id = obj.json()["id"]

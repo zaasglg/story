@@ -2,6 +2,7 @@ from uuid import UUID
 
 from conftest import AppContext, login
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from backend.identity.models import AuditLog, User, UserRole
 from backend.workforce.models import EmployeePrivateData
@@ -9,6 +10,31 @@ from backend.workforce.models import EmployeePrivateData
 
 def auth(tokens: dict[str, object]) -> dict[str, str]:
     return {"Authorization": f"Bearer {tokens['access_token']}"}
+
+
+async def test_boss_directory_includes_workers_and_masters(context: AppContext) -> None:
+    boss = auth(await login(context, UserRole.BOSS))
+    response = await context.client.get("/api/v1/boss/workers", headers=boss)
+    assert response.status_code == 200, response.text
+    assert {item["role"] for item in response.json()} == {"WORKER", "MASTER"}
+    assert len(response.json()) == 2
+
+    admin = auth(await login(context, UserRole.ADMIN))
+    response = await context.client.get("/api/v1/admin/workers", headers=admin)
+    assert response.status_code == 200, response.text
+    assert {item["role"] for item in response.json()} == {"WORKER"}
+
+    async with context.database.session_factory() as session:
+        master = await session.scalar(
+            select(User).where(User.role == UserRole.MASTER).options(selectinload(User.profile))
+        )
+        assert master is not None
+        master.profile.archived_at = master.created_at
+        await session.commit()
+
+    response = await context.client.get("/api/v1/boss/workers", headers=boss)
+    assert response.status_code == 200, response.text
+    assert {item["role"] for item in response.json()} == {"WORKER"}
 
 
 async def test_admin_workflow_and_role_safe_projections(context: AppContext) -> None:
@@ -35,7 +61,9 @@ async def test_admin_workflow_and_role_safe_projections(context: AppContext) -> 
 
     object_response = await context.client.post(
         "/api/v1/admin/objects",
-        headers=auth(admin_tokens),
+        headers={
+            "Authorization": f"Bearer {(await login(context, UserRole.BOSS))['access_token']}"
+        },
         json={
             "name": "Object Alpha",
             "city_id": city_id,

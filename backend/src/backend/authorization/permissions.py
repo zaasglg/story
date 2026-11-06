@@ -14,6 +14,7 @@ class Permission(StrEnum):
     WORKDAY_READ_TEAM = "workday:read:team"
     WORKDAY_READ_ALL = "workday:read:all"
     WORKDAY_MANAGE = "workday:manage"
+    OBJECT_MANAGE = "object:manage"
     ORGANIZATION_READ = "organization:read"
     ORGANIZATION_MANAGE = "organization:manage"
     EQUIPMENT_READ_OWN = "equipment:read:own"
@@ -79,6 +80,8 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
             Permission.EQUIPMENT_READ_ALL,
             Permission.EQUIPMENT_MANAGE,
             Permission.FINANCIAL_REQUEST_CREATE,
+            Permission.EXPENSE_READ,
+            Permission.EXPENSE_MANAGE,
             Permission.AUDIT_READ_ADMIN,
             Permission.ANNOUNCEMENT_RECEIVE,
             Permission.ANNOUNCEMENT_CREATE,
@@ -87,6 +90,7 @@ ROLE_PERMISSIONS: dict[UserRole, frozenset[Permission]] = {
     ),
     UserRole.BOSS: frozenset(
         {
+            Permission.OBJECT_MANAGE,
             Permission.EXPENSE_APPROVE,
             Permission.PROFILE_READ_OWN,
             Permission.WORKER_PUBLIC_READ,

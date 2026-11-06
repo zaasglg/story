@@ -160,6 +160,23 @@ async def totals(session: AsyncSession, filters: ExpenseFilters) -> list[Expense
     return [ExpenseTotal(currency=row[0], total=row[1], count=row[2]) for row in rows]
 
 
+@router.get("/admin/expenses-summary")
+async def expense_categories(session: Session, filters: Filters, _: Reader) -> list[dict]:
+    rows = (
+        await session.execute(
+            filters.apply(
+                select(
+                    Expense.category,
+                    Expense.currency,
+                    func.sum(Expense.amount),
+                    func.count(Expense.id),
+                )
+            ).group_by(Expense.category, Expense.currency)
+        )
+    ).all()
+    return [dict(category=row[0], currency=row[1], total=row[2], count=row[3]) for row in rows]
+
+
 @router.get("/admin/expenses/daily", response_model=list[ExpenseTotal])
 @router.get("/boss/expenses/daily", response_model=list[ExpenseTotal])
 async def daily_report(

@@ -12,6 +12,7 @@ from backend.authorization.dependencies import require_permission
 from backend.authorization.permissions import Permission
 from backend.identity.dependencies import CurrentUser, get_db_session
 from backend.identity.models import AuditLog, EmployeeProfile
+from backend.workforce.models import Brigade, City, WorkObject
 
 router = APIRouter(tags=["audit"])
 Session = Annotated[AsyncSession, Depends(get_db_session)]
@@ -26,6 +27,9 @@ class AuditRead(BaseModel):
     entity_id: UUID | None
     created_at: datetime
     succeeded: bool
+    actor_name: str | None = None
+    subject_name: str | None = None
+    changes: list[dict] = []
 
 
 @router.get("/admin/audit", response_model=list[AuditRead])
@@ -34,16 +38,80 @@ async def own_admin_audit(
     actor: Annotated[CurrentUser, Depends(require_permission(Permission.AUDIT_READ_ADMIN))],
     limit: Annotated[int, Query(ge=1, le=100)] = 25,
     offset: Annotated[int, Query(ge=0)] = 0,
+    hide_session_refresh: bool = False,
 ):
-    return (
+    query = select(AuditLog).where(AuditLog.actor_user_id == actor.id)
+    if hide_session_refresh:
+        query = query.where(AuditLog.action != "AUTH_TOKEN_REFRESHED")
+    rows = (
         await session.scalars(
-            select(AuditLog)
-            .where(AuditLog.actor_user_id == actor.id)
-            .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+            query.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
             .limit(limit)
             .offset(offset)
         )
     ).all()
+    actor_name = await session.scalar(
+        select(EmployeeProfile.full_name).where(EmployeeProfile.user_id == actor.id)
+    )
+    result = []
+    for row in rows:
+        before = safe_audit_data(row.old_value) or {}
+        after = safe_audit_data(row.new_value) or {}
+        subject = (
+            after.get("full_name")
+            or after.get("name")
+            or before.get("full_name")
+            or before.get("name")
+        )
+        if not subject and row.entity_id:
+            if row.entity_type in ("worker", "users", "user"):
+                subject = await session.scalar(
+                    select(EmployeeProfile.full_name).where(
+                        EmployeeProfile.user_id == row.entity_id
+                    )
+                )
+            elif row.entity_type == "employee_profiles":
+                profile = await session.get(EmployeeProfile, row.entity_id)
+                subject = profile.full_name if profile else None
+            else:
+                model = {
+                    "city": City,
+                    "cities": City,
+                    "brigade": Brigade,
+                    "brigades": Brigade,
+                    "object": WorkObject,
+                    "work_object": WorkObject,
+                    "work_objects": WorkObject,
+                }.get(row.entity_type)
+                if model:
+                    subject = await session.scalar(
+                        select(model.name).where(model.id == row.entity_id)
+                    )
+        changes = [
+            {"field": key, "before": before.get(key), "after": after.get(key)}
+            for key in (
+                "full_name",
+                "name",
+                "status",
+                "position",
+                "city",
+                "address",
+                "quantity",
+                "hours",
+                "m3",
+            )
+            if key in after and before.get(key) != after.get(key)
+        ]
+        result.append(
+            AuditRead.model_validate(row).model_copy(
+                update={
+                    "actor_name": actor_name or "Администратор",
+                    "subject_name": subject,
+                    "changes": changes,
+                }
+            )
+        )
+    return result
 
 
 class BossAuditRead(AuditRead):

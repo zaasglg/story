@@ -82,6 +82,22 @@ async def test_arrival_departure_duration_replay_and_duplicate(context: AppConte
     )
     assert summary.json()["worked_minutes"] == 616
     assert summary.json()["counts"]["FINISHED"] == 1
+    item = summary.json()["items"][0]
+    assert "photo_url" in item
+    assert item["city_name"]
+    filtered = await context.client.get(
+        "/api/v1/admin/attendance-summary",
+        headers=auth(admin),
+        params={"work_date": departed.json()["work_date"], "q": item["worker_name"].lower()},
+    )
+    assert filtered.status_code == 200
+    assert filtered.json()["total"] == 1
+    missing = await context.client.get(
+        "/api/v1/admin/attendance-summary",
+        headers=auth(admin),
+        params={"work_date": departed.json()["work_date"], "q": "no-such-worker"},
+    )
+    assert missing.json()["total"] == 0
     async with context.database.session_factory() as session:
         rows = list(
             (

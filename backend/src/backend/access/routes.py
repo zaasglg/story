@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from backend.access.models import PassToken, RatingEvent, WorkAuthorization
 from backend.access.rating import append_rating_event, reversed_event_ids
@@ -51,6 +52,28 @@ class AuthorizationRead(AuthorizationCreate):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     revoked_at: datetime | None = None
+
+
+@router.get("/admin/authorization-employees")
+async def authorization_employees(session: Session, _: Manager) -> list[dict]:
+    users = (
+        await session.scalars(
+            select(User)
+            .where(User.role.in_([UserRole.WORKER, UserRole.MASTER]), User.archived_at.is_(None))
+            .options(selectinload(User.profile))
+        )
+    ).all()
+    return [
+        dict(
+            id=user.id,
+            full_name=user.profile.full_name,
+            photo_url=user.profile.photo_url,
+            role=user.role,
+            employee_id=user.profile.employee_id,
+        )
+        for user in users
+        if user.profile and user.profile.archived_at is None
+    ]
 
 
 @router.get("/admin/work-authorizations", response_model=list[AuthorizationRead])
@@ -95,7 +118,17 @@ async def update_authorization(
 async def grant(
     payload: AuthorizationCreate, session: Session, actor: Manager
 ) -> WorkAuthorization:
-    await require_worker(session, payload.worker_user_id)
+    employee = await session.scalar(
+        select(User)
+        .where(
+            User.id == payload.worker_user_id,
+            User.role.in_([UserRole.WORKER, UserRole.MASTER]),
+            User.archived_at.is_(None),
+        )
+        .options(selectinload(User.profile))
+    )
+    if employee is None or employee.profile is None or employee.profile.archived_at is not None:
+        raise ApiError(404, "worker_not_found", "Employee was not found")
     item = WorkAuthorization(**payload.model_dump(), created_by=actor.id, created_at=utc_now())
     session.add(item)
     await session.flush()

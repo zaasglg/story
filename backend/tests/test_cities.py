@@ -46,7 +46,9 @@ async def test_city_management_permissions_and_shared_directory(context: AppCont
 
     obj = await context.client.post(
         "/api/v1/admin/objects",
-        headers=admin,
+        headers={
+            "Authorization": f"Bearer {(await login(context, UserRole.BOSS))['access_token']}"
+        },
         json={
             "name": "City test object",
             "address": "Central street",

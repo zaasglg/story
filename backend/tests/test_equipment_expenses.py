@@ -110,7 +110,8 @@ async def test_expense_reports_currency_archive_and_role_scope(context: AppConte
     totals = {row["currency"]: row["total"] for row in report.json()}
     assert totals == {"KZT": "10.00", "RUB": "115.00"}
     assert "revenue" not in report.text and "profit" not in report.text
-    for headers in (admin, worker, master):
+    assert (await context.client.get("/api/v1/admin/expenses", headers=admin)).status_code == 200
+    for headers in (worker, master):
         denied = await context.client.get("/api/v1/admin/expenses", headers=headers)
         assert denied.status_code == 403
     removed = await context.client.delete(f"/api/v1/boss/expenses/{ids[0]}", headers=boss)
