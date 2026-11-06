@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
@@ -160,6 +160,32 @@ async def post_image(post_id: UUID, session: Session, _: Receiver) -> Response:
         media_type="image/jpeg",
         headers={"Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff"},
     )
+
+
+@router.delete("/posts/{post_id}", status_code=204)
+async def delete_post(post_id: UUID, session: Session, actor: Publisher) -> Response:
+    item = await session.get(Announcement, post_id)
+    if item is None:
+        raise ApiError(404, "post_not_found", "Post was not found")
+    await session.execute(
+        update(Notification)
+        .where(Notification.announcement_id == post_id)
+        .values(announcement_id=None)
+    )
+    image = await session.get(PostImage, post_id)
+    if image is not None:
+        await session.delete(image)
+    add_audit_event(
+        session,
+        actor_user_id=actor.id,
+        action="POST_DELETED",
+        entity_type="announcement",
+        entity_id=item.id,
+        old_value={"title": item.title, "body": item.body},
+    )
+    await session.delete(item)
+    await session.commit()
+    return Response(status_code=204)
 
 
 class NotificationRead(AnnouncementRead):

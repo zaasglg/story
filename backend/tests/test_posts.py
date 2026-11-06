@@ -42,6 +42,18 @@ async def test_admin_and_boss_publish_posts_visible_to_every_role(context: AppCo
     assert boss_post.status_code == 201
     assert boss_post.json()["image_url"] is None
 
+    deleted = await context.client.delete(
+        f"/api/v1/posts/{created.json()['id']}", headers=headers[UserRole.BOSS]
+    )
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+    feed = await context.client.get("/api/v1/posts", headers=headers[UserRole.WORKER])
+    assert [post["id"] for post in feed.json()] == [boss_post.json()["id"]]
+    missing_image = await context.client.get(
+        f"/api/v1/posts/{created.json()['id']}/image", headers=headers[UserRole.WORKER]
+    )
+    assert missing_image.status_code == 404
+
 
 async def test_worker_and_master_cannot_publish_posts(context: AppContext) -> None:
     for role in (UserRole.WORKER, UserRole.MASTER):
@@ -52,3 +64,7 @@ async def test_worker_and_master_cannot_publish_posts(context: AppContext) -> No
             data={"title": "Недоступно", "body": "Этот пост нельзя создать."},
         )
         assert response.status_code == 403
+        denied_delete = await context.client.delete(
+            "/api/v1/posts/00000000-0000-0000-0000-000000000000", headers=headers
+        )
+        assert denied_delete.status_code == 403
