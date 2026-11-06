@@ -61,6 +61,7 @@ from backend.workforce.service import (
     require_city,
     require_closed_shift,
     require_context_closed,
+    require_salary_account_owner,
     require_worker,
     team_projection,
     validate_worker_city,
@@ -1132,7 +1133,7 @@ async def read_salary_account(
     current: Annotated[CurrentUser, Depends(require_permission(Permission.WORKER_BANK_READ_ALL))],
     request: Request,
 ) -> SalaryAccountWrite | None:
-    await require_worker(session, worker_id)
+    await require_salary_account_owner(session, worker_id)
     private = await session.scalar(
         select(EmployeePrivateData).where(EmployeePrivateData.user_id == worker_id)
     )
@@ -1167,7 +1168,7 @@ async def write_salary_account(
     current: Annotated[CurrentUser, Depends(require_permission(Permission.COMPANY_BANK_MANAGE))],
     request: Request,
 ) -> SalaryAccountWrite:
-    await require_worker(session, worker_id)
+    await require_salary_account_owner(session, worker_id)
     private = await session.scalar(
         select(EmployeePrivateData).where(EmployeePrivateData.user_id == worker_id)
     )
@@ -1190,7 +1191,7 @@ async def delete_salary_account(
     current: Annotated[CurrentUser, Depends(require_permission(Permission.COMPANY_BANK_MANAGE))],
     request: Request,
 ) -> None:
-    await require_worker(session, worker_id)
+    await require_salary_account_owner(session, worker_id)
     private = await session.scalar(
         select(EmployeePrivateData).where(EmployeePrivateData.user_id == worker_id)
     )

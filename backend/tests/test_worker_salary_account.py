@@ -1,17 +1,22 @@
+from uuid import uuid4
+
+import pytest
 from conftest import login
 from sqlalchemy import select
 
-from backend.identity.models import AuditLog, User, UserRole
+from backend.core.time import utc_now
+from backend.identity.models import AuditLog, EmployeeProfile, User, UserRole
 from backend.workforce.models import EmployeePrivateData
 
 
-async def test_salary_account_permissions_encryption_and_lifecycle(context):
+@pytest.mark.parametrize("owner_role", [UserRole.WORKER, UserRole.MASTER])
+async def test_salary_account_permissions_encryption_and_lifecycle(context, owner_role):
     headers = {}
     for role in UserRole:
         tokens = await login(context, role)
         headers[role] = {"Authorization": f"Bearer {tokens['access_token']}"}
     async with context.database.session_factory() as session:
-        worker_id = await session.scalar(select(User.id).where(User.role == UserRole.WORKER))
+        worker_id = await session.scalar(select(User.id).where(User.role == owner_role))
     path = f"/api/v1/admin/workers/{worker_id}/salary-account"
     account = {
         "bank_name": "Halyk",
@@ -52,3 +57,33 @@ async def test_salary_account_permissions_encryption_and_lifecycle(context):
     assert unchanged.json()["iban"] == normalized
     assert (await context.client.delete(path, headers=headers[UserRole.BOSS])).status_code == 204
     assert (await context.client.get(path, headers=headers[UserRole.BOSS])).json() is None
+
+
+@pytest.mark.parametrize(
+    "owner_state",
+    ["admin", "boss", "archived_user", "archived_profile", "missing_profile", "missing"],
+)
+async def test_salary_account_rejects_ineligible_or_archived_owner(context, owner_state):
+    tokens = await login(context, UserRole.BOSS)
+    headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+    role = {"admin": UserRole.ADMIN, "boss": UserRole.BOSS}.get(owner_state, UserRole.MASTER)
+    async with context.database.session_factory() as session:
+        owner = await session.scalar(select(User).where(User.role == role))
+        owner_id = owner.id
+        profile = await session.scalar(
+            select(EmployeeProfile).where(EmployeeProfile.user_id == owner_id)
+        )
+        if owner_state == "archived_user":
+            owner.archived_at = utc_now()
+        elif owner_state == "archived_profile":
+            profile.archived_at = utc_now()
+        elif owner_state == "missing_profile":
+            await session.delete(profile)
+        elif owner_state == "missing":
+            owner_id = uuid4()
+        await session.commit()
+    path = f"/api/v1/admin/workers/{owner_id}/salary-account"
+    account = {"bank_name": "Synthetic", "iban": "123", "account_holder": "Synthetic"}
+    assert (await context.client.get(path, headers=headers)).status_code == 404
+    assert (await context.client.put(path, headers=headers, json=account)).status_code == 404
+    assert (await context.client.delete(path, headers=headers)).status_code == 404

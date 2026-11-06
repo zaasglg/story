@@ -28,9 +28,19 @@ async def require_city(session: AsyncSession, city_id: UUID) -> City:
 
 
 async def require_worker(session: AsyncSession, worker_id: UUID) -> User:
+    return await _require_employee(session, worker_id, (UserRole.WORKER,))
+
+
+async def require_salary_account_owner(session: AsyncSession, worker_id: UUID) -> User:
+    return await _require_employee(session, worker_id, (UserRole.WORKER, UserRole.MASTER))
+
+
+async def _require_employee(
+    session: AsyncSession, worker_id: UUID, roles: tuple[UserRole, ...]
+) -> User:
     result = await session.execute(
         select(User)
-        .where(User.id == worker_id, User.role == UserRole.WORKER, User.archived_at.is_(None))
+        .where(User.id == worker_id, User.role.in_(roles), User.archived_at.is_(None))
         .options(selectinload(User.profile))
     )
     worker = result.scalar_one_or_none()
