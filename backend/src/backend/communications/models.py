@@ -16,6 +16,14 @@ class Announcement(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class PostImage(Base):
+    __tablename__ = "post_images"
+    post_id: Mapped[UUID] = mapped_column(
+        ForeignKey("announcements.id", ondelete="CASCADE"), primary_key=True
+    )
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, deferred=True)
+
+
 class Notification(Base):
     __tablename__ = "notifications"
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)

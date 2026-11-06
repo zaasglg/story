@@ -3,11 +3,12 @@ from datetime import datetime
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Form, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, Request, Response, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from backend.audit.service import add_audit_event
 from backend.authorization.dependencies import require_permission
@@ -18,6 +19,7 @@ from backend.communications.models import (
     ChatMessage,
     ChatThread,
     Notification,
+    PostImage,
     SupportTicket,
 )
 from backend.communications.push import stage_notifications
@@ -25,6 +27,7 @@ from backend.core.errors import ApiError
 from backend.core.time import utc_now
 from backend.identity.dependencies import CurrentUser, get_db_session
 from backend.identity.models import AccountStatus, EmployeeProfile, User, UserRole
+from backend.workforce.photos import MAX_PHOTO_BYTES, normalize_photo
 
 router = APIRouter(tags=["communications"])
 Session = Annotated[AsyncSession, Depends(get_db_session)]
@@ -45,6 +48,118 @@ class AnnouncementRead(TextCreate):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
     created_at: datetime
+
+
+class PostRead(AnnouncementRead):
+    author_name: str
+    author_role: UserRole
+    image_url: str | None = None
+
+
+def post_read(
+    item: Announcement, author_name: str, author_role: UserRole, has_image: bool
+) -> PostRead:
+    return PostRead(
+        id=item.id,
+        title=item.title,
+        body=item.body,
+        created_at=item.created_at,
+        author_name=author_name,
+        author_role=author_role,
+        image_url=f"/posts/{item.id}/image" if has_image else None,
+    )
+
+
+@router.post("/posts", response_model=PostRead, status_code=201)
+async def create_post(
+    session: Session,
+    actor: Publisher,
+    title: Annotated[str, Form(min_length=1, max_length=255)],
+    body: Annotated[str, Form(min_length=1, max_length=5000)],
+    image: Annotated[UploadFile | None, File()] = None,
+) -> PostRead:
+    title = title.strip()
+    body = body.strip()
+    if not title or not body:
+        raise ApiError(422, "empty_post", "Post title and text are required")
+    item = Announcement(title=title, body=body, created_by=actor.id, created_at=utc_now())
+    session.add(item)
+    await session.flush()
+    if image is not None:
+        try:
+            content = await image.read(MAX_PHOTO_BYTES + 1)
+        finally:
+            await image.close()
+        if len(content) > MAX_PHOTO_BYTES:
+            raise ApiError(413, "photo_too_large", "Photo must not exceed 5 MB")
+        normalized = await run_in_threadpool(normalize_photo, content)
+        session.add(PostImage(post_id=item.id, content=normalized))
+    recipients = (
+        await session.scalars(
+            select(User.id).where(User.status == AccountStatus.ACTIVE, User.archived_at.is_(None))
+        )
+    ).all()
+    await stage_notifications(
+        session,
+        [
+            Notification(
+                recipient_user_id=user_id,
+                title=title,
+                body=body,
+                announcement_id=item.id,
+                created_at=item.created_at,
+            )
+            for user_id in recipients
+        ],
+    )
+    profile = await session.scalar(
+        select(EmployeeProfile).where(EmployeeProfile.user_id == actor.id)
+    )
+    add_audit_event(
+        session,
+        actor_user_id=actor.id,
+        action="POST_CREATED",
+        entity_type="announcement",
+        entity_id=item.id,
+        new_value={"title": title, "body": body, "has_image": image is not None},
+    )
+    await session.commit()
+    return post_read(
+        item, profile.full_name if profile else actor.phone, actor.role, image is not None
+    )
+
+
+@router.get("/posts", response_model=list[PostRead])
+async def posts(
+    session: Session, _: Receiver, limit: Limit = 50, offset: Offset = 0
+) -> list[PostRead]:
+    rows = (
+        await session.execute(
+            select(Announcement, EmployeeProfile.full_name, User.role, PostImage.post_id)
+            .join(User, User.id == Announcement.created_by)
+            .outerjoin(EmployeeProfile, EmployeeProfile.user_id == User.id)
+            .outerjoin(PostImage, PostImage.post_id == Announcement.id)
+            .order_by(Announcement.created_at.desc(), Announcement.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+    return [
+        post_read(item, full_name or "ALASH", role, image_id is not None)
+        for item, full_name, role, image_id in rows
+    ]
+
+
+@router.get("/posts/{post_id}/image")
+async def post_image(post_id: UUID, session: Session, _: Receiver) -> Response:
+    content = await session.scalar(select(PostImage.content).where(PostImage.post_id == post_id))
+    if content is None:
+        raise ApiError(404, "post_image_not_found", "Post image was not found")
+    return Response(
+        content,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 class NotificationRead(AnnouncementRead):
