@@ -3,6 +3,7 @@
 import sqlalchemy as sa
 
 from alembic import op
+from backend.core.migration_schema import create_table
 
 revision = "20261105_0043"
 down_revision = "20261105_0042"
@@ -10,7 +11,7 @@ branch_labels = depends_on = None
 
 
 def upgrade():
-    op.create_table(
+    create_table(
         "finance_receipts",
         sa.Column("id", sa.Uuid(), primary_key=True),
         sa.Column("filename", sa.String(255), nullable=False),

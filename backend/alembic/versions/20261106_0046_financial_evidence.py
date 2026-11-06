@@ -3,6 +3,7 @@
 import sqlalchemy as sa
 
 from alembic import op
+from backend.core.migration_schema import add_column
 
 revision = "20261106_0046"
 down_revision = "20261106_0045"
@@ -10,7 +11,7 @@ branch_labels = depends_on = None
 
 
 def upgrade():
-    op.add_column("financial_requests", sa.Column("evidence_url", sa.String(255), nullable=True))
+    add_column("financial_requests", sa.Column("evidence_url", sa.String(255), nullable=True))
 
 
 def downgrade():

@@ -3,6 +3,7 @@
 import sqlalchemy as sa
 
 from alembic import op
+from backend.core.migration_schema import create_table
 
 revision = "20261105_0042"
 down_revision = "20261104_0041"
@@ -10,7 +11,7 @@ branch_labels = depends_on = None
 
 
 def upgrade():
-    op.create_table(
+    created = create_table(
         "employee_permits",
         sa.Column(
             "worker_user_id",
@@ -23,6 +24,8 @@ def upgrade():
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_by", sa.Uuid(), sa.ForeignKey("users.id", ondelete="RESTRICT")),
     )
+    if not created:
+        return
     op.execute("""
         INSERT INTO employee_permits (worker_user_id, code, granted, updated_at)
         SELECT users.id, permits.code, true, CURRENT_TIMESTAMP

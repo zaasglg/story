@@ -3,6 +3,7 @@
 import sqlalchemy as sa
 
 from alembic import op
+from backend.core.migration_schema import create_table, ensure_index
 
 revision = "20261106_0047"
 down_revision = "20261106_0046"
@@ -10,7 +11,7 @@ branch_labels = depends_on = None
 
 
 def upgrade():
-    op.create_table(
+    create_table(
         "personal_notes",
         sa.Column("id", sa.Uuid(), primary_key=True),
         sa.Column(
@@ -23,7 +24,7 @@ def upgrade():
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
-    op.create_index("ix_personal_notes_owner_id", "personal_notes", ["owner_id"])
+    ensure_index("ix_personal_notes_owner_id", "personal_notes", ["owner_id"])
 
 
 def downgrade():
